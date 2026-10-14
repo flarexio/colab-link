@@ -52,6 +52,37 @@ Phase 1 (current): prove the Colab side works. Phase 2: add the API layer.
 - Do not run `repl`, `console`, `auth` or `drivemount` interactively; they need a TTY.
 - VM image (2026-10): Python 3.13, torch 2.11 + cu130, transformers 5.18; **vLLM is not preinstalled**. About 207 GB of disk.
 
+## Google Drive (2026-10-14, in progress)
+- **`colab drivemount` (DriveFS) cannot be automated**: it uses Colab's credentials propagation (`dfs_ephemeral`). The authorization URL carries the VM's `endpoint`, so **every new VM needs a human to grant access once**. It also needs the same CLI process to stay open and wait for Enter after the grant (it reads `/dev/tty`); we have no TTY, so the process just fails and the next attempt generates new temporary credentials, making the earlier grant useless. Tried twice; both failed. ⇒ Do not use mounting.
+- **Use the Drive REST API directly instead**: `tools/drive_token.py` (run with the CLI venv's python) obtains an access token from the CLI's own oauth2 login. Its scopes include `drive.file`, which can only access files created by this OAuth client — enough for a model/environment cache, with no further authorization needed.
+  - That token belongs to the Google Cloud SDK client, so calling the Drive API **requires the header `x-goog-user-project: <GCP project>`**, and that project must have the Drive API enabled.
+  - **Using `flarex-439501`** (the user's choice; the Drive API was enabled on 2026-10-14 through the serviceusage API). Usage: `runner --drive flarex-439501`.
+  - The token is sent to the VM by uploading a file (do not put it in exec code, because the CLI records executed code in `~/.config/colab-cli/history`).
+- **Drive location**: the `colab-link-cache` folder at the root of My Drive (https://drive.google.com/drive/folders/111AITU93plTyk1L8aVoZEa0kZHRSrIjh). It is found **by name**, so it can be moved but must not be renamed. Cache files count toward the user's Drive quota.
+- `colab_link/drive_vm.py` (runs on the VM, stdlib only): `ls` / `put` (resumable, 64 MB chunks, replaces a file of the same name) / `get` (16 threads × 64 MB ranged parallel download).
+- **Measured speeds (L4, 2026-10-14)**: Drive download **~256 MB/s** (8.3 GB in 32 s), about the same as HF (~300 MB/s); upload only **~31 MB/s** (8.3 GB in 269 s).
+  - ⇒ **Keep pulling model weights from HF**; putting them on Drive is no faster.
+- **venv cache**: `venv-vllm0.31.0-py313-torch2.11.0-cu130.tar` (8.3 GB, uncompressed; the VM has no zstd), built by `jobs/build_env_cache.py`. Path is `/content/venv` (`--system-site-packages`).
+  - Restoring from Drive takes about **55 s** (32 s download + 23 s extract). Installing straight from PyPI ranges from 34 s to 4 min, so the cache's main benefit is **stability**, not saved time.
+  - Run it with `--python /content/venv/bin/python`. The runner automatically puts that `bin/` on PATH (otherwise vLLM can't find `ninja`).
+  - The cache name includes the image's Python and torch versions; rebuild it when Colab updates its image.
+- **Engine init breakdown (L4, Qwen3.5-9B fp8, 344 s total)**: image encoder profiling ~56 s, torch.compile 62 s (cache: `~/.cache/vllm`), initial profiling/warmup 88 s (part of it is Triton kernel compilation, cache: `~/.triton`), CUDA graph capture 41 s, **flashinfer sampling JIT ~100 s** (cache: `~/.cache/flashinfer`). Before that: weight download 55 s and model load ~70 s.
+  - ⇒ The JIT/compile caches are what save real time. **Cache names must include the model, quantization and GPU** (e.g. `jitcache-qwen35-9b-fp8-L4.tar`), because the compiled results depend on all of them.
+  - The `.pyc` files in the venv cache barely helped (load_s 523 → 498 s).
+- **Cache results (L4, Qwen3.5-9B fp8, 200 tasks, 2026-10-14)**:
+
+| Variant | Total time | CU | load_s | init engine | Notes |
+|---|---|---|---|---|---|
+| Install vLLM from PyPI (baseline) | 668 s | 0.29 | 523 s | 353 s | |
+| Drive venv | 744 s | 0.32 | 498 s | 344 s | provisioning happened to take 110 s |
+| Drive venv + vLLM compile cache | 596 s | 0.25 | 430 s | 288 s | torch.compile 62 → 2.3 s |
+| **Drive venv + all JIT caches** | **483 s** | **0.21** | **304 s** | **176 s** | flashinfer JIT skipped; 100/100 correct |
+
+  - **Saves about 185 s (28%) and about 0.08 CU per run.** Restoring (venv 8.3 GB + JIT cache 90 MB) takes about 75 s.
+  - `jitcache-<model>-<quant>-<gpu>.tar` = `~/.cache/vllm` + `~/.cache/flashinfer` + `~/.triton` (extract into `/root`). Run once without a cache and use `--post` to save it.
+  - Still not cacheable: HF weight download 54 s, initial profiling/warmup 89 s (the Triton cache does not shorten it; it is mainly image-encoder profiling and dummy runs), CUDA graph capture 40 s.
+  - Next optimizations to try: lower the multimodal profiling cost (vLLM's `skip_mm_profiling`, or limit image size); drop packages from the venv that already match the system's to shrink the 8.3 GB; make cache restore and save a built-in runner option instead of hand-written `--setup`/`--post`.
+
 ## Layout
 - `colab_link/session.py`: `ColabSession`, a thin wrapper around the CLI (start/exec/upload/download/stop; context manager).
 - `colab_link/runner.py`: one job end to end: new → upload `job.py` + `in.tar.gz` → detached launch (`pip install` + `python job.py in out`, exit code written to `exitcode`) → poll `exitcode`, `out/progress.json` and the tail of `log.txt` → download `out.tar.gz` → stop. Writes `run.json` with the timing breakdown.

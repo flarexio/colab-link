@@ -15,6 +15,19 @@ class ColabError(RuntimeError):
     pass
 
 
+CLI_PYTHON = Path.home() / ".local/share/uv/tools/google-colab-cli/bin/python3"
+
+
+def drive_token() -> str:
+    """Fresh access token from the CLI's own login (drive.file scope, ~1 h)."""
+    script = Path(__file__).resolve().parent.parent / "tools" / "drive_token.py"
+    out = subprocess.run([str(CLI_PYTHON), str(script)], capture_output=True, text=True,
+                         env=_cli_env(), timeout=60)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise ColabError(f"could not get Drive token: {out.stderr[-500:]}")
+    return out.stdout.strip()
+
+
 def _cli_env() -> dict:
     # Hermes injects a Python 3.14 PYTHONPATH that breaks the CLI's own venv.
     env = dict(os.environ)

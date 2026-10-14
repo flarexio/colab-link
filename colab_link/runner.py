@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .session import ColabSession
+from .session import ColabSession, drive_token
 
 REMOTE = "/content/run"
 
@@ -62,7 +62,9 @@ def log(msg: str) -> None:
 
 def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
             pip: list[str], env: dict[str, str], poll_s: float = 20,
-            max_hours: float = 6, keep_log_lines: int = 5) -> int:
+            max_hours: float = 6, keep_log_lines: int = 5,
+            setup: list[str] | None = None, python: str = "python",
+            drive_project: str | None = None, post: list[str] | None = None) -> int:
     name = f"cl-{uuid.uuid4().hex[:8]}"
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -83,14 +85,32 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
 
             # The contents API behind `colab upload` 500s if the parent dir is missing.
             sess.exec(f"import os; os.makedirs({REMOTE!r}, exist_ok=True)", timeout=60)
-            sess.upload(job, f"{REMOTE}/job.py")
-            sess.upload(tar_in, f"{REMOTE}/in.tar.gz")
+            def upload(local: Path, remote: str) -> None:
+                t = time.time()
+                sess.upload(local, remote)
+                log(f"uploaded {remote} ({local.stat().st_size / 1e6:.1f} MB) in {time.time() - t:.1f}s")
+
+            upload(job, f"{REMOTE}/job.py")
+            upload(tar_in, f"{REMOTE}/in.tar.gz")
+            if drive_project:
+                # Token goes up as a file, never inside exec code (the CLI logs code).
+                tok = Path(tmp) / "drive_token"
+                tok.write_text(drive_token())
+                tok.chmod(0o600)
+                upload(tok, f"{REMOTE}/.drive_token")
+                upload(Path(__file__).with_name("drive_vm.py"), f"{REMOTE}/drive_vm.py")
+                env = {**env, "DRIVE_QUOTA_PROJECT": drive_project,
+                       "DRIVE_TOKEN_FILE": f"{REMOTE}/.drive_token"}
             timings["upload_s"] = time.time() - t0 - timings["provision_s"]
 
-            steps = []
+            steps = list(setup or [])
+            if "/" in python:
+                # A venv interpreter needs its bin/ on PATH too (vLLM shells out to ninja etc.).
+                steps.insert(0, f"export PATH={shlex.quote(python.rsplit('/', 1)[0])}:$PATH")
             if pip:
                 steps.append("uv pip install --system -q " + " ".join(map(shlex.quote, pip)))
-            steps.append("python job.py in out")
+            steps.append(f"{python} job.py in out")
+            steps += list(post or [])
             # Exit code of the first failing step lands in ./exitcode.
             cmd = "( set -e; " + "; ".join(steps) + " ); echo $? > exitcode"
             sess.exec(LAUNCH.format(remote=REMOTE, env=env, cmd=cmd), timeout=120)
@@ -155,9 +175,17 @@ def main() -> None:
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE for the job")
     ap.add_argument("--poll", type=float, default=20)
     ap.add_argument("--max-hours", type=float, default=6)
+    ap.add_argument("--setup", action="append", default=[],
+                    help="shell command run on the VM (in /content/run) before pip/job")
+    ap.add_argument("--python", default="python", help="interpreter for job.py on the VM")
+    ap.add_argument("--post", action="append", default=[],
+                    help="shell command run on the VM after the job succeeds")
+    ap.add_argument("--drive", metavar="GCP_PROJECT", default=None,
+                    help="ship a Drive token + drive_vm.py; project is the Drive API quota project")
     a = ap.parse_args()
     env = dict(kv.split("=", 1) for kv in a.env)
-    sys.exit(run_job(a.job, a.input, a.out, a.gpu, a.pip, env, a.poll, a.max_hours))
+    sys.exit(run_job(a.job, a.input, a.out, a.gpu, a.pip, env, a.poll, a.max_hours,
+                     setup=a.setup, python=a.python, drive_project=a.drive, post=a.post))
 
 
 if __name__ == "__main__":
