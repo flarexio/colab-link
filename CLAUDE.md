@@ -4,17 +4,13 @@ Goal: run Python jobs on rented Colab GPUs on demand: start a session → set up
 Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (done) → ③.5 NATS edge worker + **service mode/warm workers/container (current)** → ④ HTTP API (upload to Drive + call `run`).
 
 **Keep this file updated**: whenever you verify a new fact, hit a pitfall, or make a design decision, write it here so the next session can pick it up.
-
-## Working rules (from the user)
-- Reply to the user in Traditional Chinese.
-- **Claude usage check**: at the end of every stage, run `python3 tools/claude_usage.py` (exit code 2 = over 90%). If over 90%: first finish writing the current file, make sure no Colab session is still running (`colab sessions`, stop any leftover to avoid wasting CU), then schedule a resume after the reset time (`resume_at`) and continue from there. Don't stall.
-- Models: use newer Qwen versions, pulled from HF for now. Moving them to Google Drive is to be discussed later.
+**This repo is public**: put no credentials, account emails, GCP project ids, Drive folder ids or edge ids here. Those, along with the user's working rules and local environment notes, go in `CLAUDE.local.md` (gitignored, loaded automatically).
 
 ## Budget
-- **200 CU per month**; the user wants to use as much of it as possible. Check the balance with `colab usage`.
+- Check the CU balance with `colab usage` (or `colab-link usage`).
 - Measured rates (2026-10-14, CU per hour):
 
-| GPU | VRAM | CPU / RAM | CU/h | Hours from 200 CU |
+| GPU | VRAM | CPU / RAM | CU/h | Hours per 200 CU |
 |---|---|---|---|---|
 | T4 | 15 GB | 2 / 12 GB | 1.07 | ~187 |
 | L4 | 23 GB | 12 / 52 GB | 1.54 | ~130 |
@@ -42,9 +38,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 | Qwen3.5-9B / 4B | 19.3 / 9.3 GB | L4 |
 
 ## Colab CLI essentials (`google-colab-cli` 0.7.4)
-- **PYTHONPATH conflict**: Hermes injects a Python 3.14 `PYTHONPATH`, which crashes the CLI on `pydantic_core`. `~/.local/bin/colab` was changed into a wrapper that runs `unset PYTHONPATH` first. After `uv tool upgrade` it may revert to a symlink; if so, rebuild the wrapper. `colab_link/session.py` also removes the variable when it calls the CLI.
-  - Source (per Jarvis, 2026-10-14): the tmux server was started by the Hermes terminal tool, and Hermes `pm/environments.py` `activate_dependencies` exports PYTHONPATH (a leftover from the old environment `04c7bbc4…`). Jarvis has removed PYTHONPATH from the tmux global environment and the `claude-rc-colab-link` session, and restarted Claude with `env -u PYTHONPATH`. Verified: the Claude process and its child shells no longer have PYTHONPATH, and running the uv tool's `colab` directly (bypassing the wrapper) works. The underlying Hermes issue is not fixed yet (Hermes terminal child processes may still carry it), so **keep the wrapper for now and do not change `~/.bashrc`**.
-- **Auth**: oauth2. The token is at `~/.config/colab-cli/token.json` (account mirror770109@gmail.com). On expiry the CLI prompts for an authorization code. In a non-interactive session: run it in the background with a FIFO as stdin, hand the URL to the user, then write the code they send back into the FIFO. **The user wants the URL whenever a login is needed.**
+- **Auth**: oauth2. The token is at `~/.config/colab-cli/token.json` (account: see CLAUDE.local.md). On expiry the CLI prompts for an authorization code. In a non-interactive session: run it in the background with a FIFO as stdin, hand the URL to the user, then write the code they send back into the FIFO.
 - **`exec --timeout` only bounds how long the CLI waits** (default 30 s). On timeout the CLI exits with an error, but **the remote kernel keeps running**. So long jobs must not run through `exec` directly; launch them detached on the VM and poll (that is how `runner.py` works).
 - Kernel state persists across `exec` calls in the same session. Default cwd is `/content`.
 - `--config <file>` isolates the local session state. The runner gives every job its own state file so jobs can run in parallel.
@@ -56,9 +50,9 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - **`colab drivemount` (DriveFS) cannot be automated**: it uses Colab's credentials propagation (`dfs_ephemeral`). The authorization URL carries the VM's `endpoint`, so **every new VM needs a human to grant access once**. It also needs the same CLI process to stay open and wait for Enter after the grant (it reads `/dev/tty`); we have no TTY, so the process just fails and the next attempt generates new temporary credentials, making the earlier grant useless. Tried twice; both failed. ⇒ Do not use mounting.
 - **Use the Drive REST API directly instead**: `tools/drive_token.py` (run with the CLI venv's python) obtains an access token from the CLI's own oauth2 login. Its scopes include `drive.file`, which can only access files created by this OAuth client — enough for a model/environment cache, with no further authorization needed.
   - That token belongs to the Google Cloud SDK client, so calling the Drive API **requires the header `x-goog-user-project: <GCP project>`**, and that project must have the Drive API enabled.
-  - **Using `flarex-439501`** (the user's choice; the Drive API was enabled on 2026-10-14 through the serviceusage API). Usage: `runner --drive flarex-439501`.
+  - The project comes from `COLAB_LINK_DRIVE_PROJECT` (or `[drive] project` in profiles.toml). Locally it is set in the gitignored `.env`, which `bin/colab-link` loads; the value is in CLAUDE.local.md.
   - The token is sent to the VM by uploading a file (do not put it in exec code, because the CLI records executed code in `~/.config/colab-cli/history`).
-- **Drive location**: the `colab-link-cache` folder at the root of My Drive (https://drive.google.com/drive/folders/111AITU93plTyk1L8aVoZEa0kZHRSrIjh). It is found **by name**, so it can be moved but must not be renamed. Cache files count toward the user's Drive quota.
+- **Drive location**: the `colab-link-cache` folder at the root of My Drive. It is found **by name**, so it can be moved but must not be renamed. Cache files count toward the user's Drive quota.
 - `colab_link/drive_vm.py` (runs on the VM, stdlib only): `ls` / `put` (resumable, 64 MB chunks, replaces a file of the same name) / `get` (16 threads × 64 MB ranged parallel download).
 - **Measured speeds (L4, 2026-10-14)**: Drive download **~256 MB/s** (8.3 GB in 32 s), about the same as HF (~300 MB/s); upload only **~31 MB/s** (8.3 GB in 269 s).
   - ⇒ **Keep pulling model weights from HF**; putting them on Drive is no faster.
@@ -94,6 +88,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - `colab_link/service.py`: **`colab-link serve`** (the server-side service; see the "Service mode" section). `colab_link/client.py`: submit/fetch/status for the CLI.
 - `colab_link/jobhost.py` (on the VM): keeps a job module that defines `handle(in_dir, out_dir)` loaded, so a warm worker loads the model only once.
 - `Dockerfile` / `compose.yaml`: container for the service (image `flarexio/colab-link`).
+- `.github/workflows/build.yml` (each push: compileall + an amd64/arm64 image build, not pushed); `release.yml` (pushing a `vX.Y.Z` tag builds both architectures and pushes `flarexio/colab-link:{X.Y.Z,X.Y,X,latest}` to Docker Hub; secrets `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, same as claude-runner). `README.md` is the public-facing documentation.
 - `colab_link/vm_env.py` (on the VM): restores or builds the venv and JIT caches, and uploads anything new after the job.
 - `colab_link/drive_vm.py` (VM or local): Drive API ls/put/get/rm.
 - `jobs/vlm_batch.py`: vLLM batch over `tasks.jsonl` (text or text + image) → `results.jsonl` + `metrics.json`.

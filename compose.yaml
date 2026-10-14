@@ -3,6 +3,9 @@ services:
     image: flarexio/colab-link
     build: .
     restart: unless-stopped
+    environment:
+      # GCP project with the Drive API enabled (put it in .env next to this file)
+      COLAB_LINK_DRIVE_PROJECT: ${COLAB_LINK_DRIVE_PROJECT:?set COLAB_LINK_DRIVE_PROJECT}
     volumes:
       - ~/.flarex/colab-link:/root/.flarex/colab-link:ro   # id + user.creds (FlareX edge)
       - ~/.config/colab-cli:/root/.config/colab-cli        # colab CLI OAuth token (refreshed in place)

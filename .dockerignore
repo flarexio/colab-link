@@ -5,3 +5,6 @@ logs
 examples
 probe
 **/__pycache__
+.env
+CLAUDE.local.md
+.github

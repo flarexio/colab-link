@@ -11,3 +11,7 @@ examples/ocr_demo/
 
 # uv project venv
 .venv/
+
+# Private notes and local settings (see CLAUDE.md)
+CLAUDE.local.md
+.env

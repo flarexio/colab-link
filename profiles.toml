@@ -3,7 +3,7 @@
 # The venv and JIT caches on Drive are keyed automatically (see colab_link/vm_env.py).
 
 [drive]
-project = "flarex-439501"     # GCP quota project with the Drive API enabled
+project = ""                  # GCP quota project with the Drive API enabled; or env COLAB_LINK_DRIVE_PROJECT
 root = "colab-link-cache"     # Drive folder for venv/JIT caches (found by name; do not rename)
 jobs_root = "colab-link-jobs" # Drive folder for job inputs/outputs (deleted after each run)
 

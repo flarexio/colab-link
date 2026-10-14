@@ -1,7 +1,8 @@
 # colab-link service: NATS endpoints + JetStream job queue + warm Colab workers.
 #
-#   docker build -t flarexio/colab-link .
+#   docker build -t flarexio/colab-link .      (released images: amd64 + arm64)
 #   docker run -d --name colab-link \
+#     -e COLAB_LINK_DRIVE_PROJECT=<gcp-project> \
 #     -v ~/.flarex/colab-link:/root/.flarex/colab-link:ro \
 #     -v ~/.config/colab-cli:/root/.config/colab-cli \
 #     -v colab-link-state:/data \

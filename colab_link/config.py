@@ -51,5 +51,5 @@ def load(path: str | None = None) -> Config:
                                  idle_minutes=float(p.get("idle_minutes", 10)),
                                  max_workers=int(p.get("max_workers", 1)))
     drive = raw.get("drive", {})
-    return Config(drive_project=drive.get("project"), drive_root=drive.get("root", "colab-link-cache"),
+    return Config(drive_project=os.environ.get("COLAB_LINK_DRIVE_PROJECT") or drive.get("project") or None, drive_root=drive.get("root", "colab-link-cache"),
                   drive_jobs_root=drive.get("jobs_root", "colab-link-jobs"), profiles=profiles)

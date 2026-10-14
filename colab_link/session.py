@@ -33,7 +33,7 @@ def drive_token() -> str:
 
 
 def _cli_env() -> dict:
-    # Hermes injects a Python 3.14 PYTHONPATH that breaks the CLI's own venv.
+    # A PYTHONPATH inherited from another Python install breaks the CLI's own venv.
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)

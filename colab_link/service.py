@@ -89,6 +89,8 @@ class Service:
         self.token = ""
         self.token_t = 0.0
         self.nc = self.js = self.kv = None
+        if not cfg.drive_project:
+            raise SystemExit("no GCP quota project for the Drive API: set COLAB_LINK_DRIVE_PROJECT")
         STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     # -- setup -----------------------------------------------------------------

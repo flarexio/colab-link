@@ -1,5 +1,7 @@
 #!/bin/sh
 # Entry point: runs the CLI in the project's uv venv. PYTHONPATH is cleared so a
-# leaked Hermes path can't shadow the venv's packages (see CLAUDE.md).
+# PYTHONPATH leaked from another tool can't shadow the venv's packages.
+# Local settings (e.g. COLAB_LINK_DRIVE_PROJECT) may live in a gitignored .env.
 here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+if [ -f "$here/.env" ]; then set -a; . "$here/.env"; set +a; fi
 exec env -u PYTHONPATH uv run -q --project "$here" python -m colab_link "$@"

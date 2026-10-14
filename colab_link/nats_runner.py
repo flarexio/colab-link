@@ -66,7 +66,10 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
-def _drive(project: str, cache_root: str):
+def _drive(project: str | None, cache_root: str):
+    if not project:
+        sys.exit("no GCP quota project for the Drive API: set COLAB_LINK_DRIVE_PROJECT "
+                 "(or [drive] project in profiles.toml); see README")
     os.environ["DRIVE_TOKEN"] = drive_token()
     os.environ["DRIVE_QUOTA_PROJECT"] = project
     os.environ["DRIVE_ROOT"] = cache_root

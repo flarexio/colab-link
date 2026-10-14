@@ -32,6 +32,9 @@ STATE_DIR = Path.home() / ".cache" / "colab-link" / "state"
 
 
 def _drive(cfg: config.Config):
+    if not cfg.drive_project:
+        sys.exit("no GCP quota project for the Drive API: set COLAB_LINK_DRIVE_PROJECT "
+                 "(or [drive] project in profiles.toml); see README")
     os.environ["DRIVE_TOKEN"] = drive_token()
     os.environ["DRIVE_QUOTA_PROJECT"] = cfg.drive_project
     os.environ["DRIVE_ROOT"] = cfg.drive_root
