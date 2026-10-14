@@ -16,7 +16,10 @@ class ColabError(RuntimeError):
     pass
 
 
-CLI_PYTHON = Path.home() / ".local/share/uv/tools/google-colab-cli/bin/python3"
+# The interpreter google-colab-cli is installed in (tools/drive_token.py imports it).
+# The container image installs both into one venv and sets COLAB_CLI_PYTHON.
+CLI_PYTHON = Path(os.environ.get("COLAB_CLI_PYTHON")
+                  or Path.home() / ".local/share/uv/tools/google-colab-cli/bin/python3")
 
 
 def drive_token() -> str:

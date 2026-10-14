@@ -26,7 +26,9 @@ from pathlib import Path
 
 VENV = "/content/venv"
 STATE = Path(os.environ.get("VM_ENV_STATE", "/content/run/env_state.json"))
-JIT_DIRS = [".cache/vllm", ".cache/flashinfer", ".triton"]  # relative to /root
+# Relative to /root. worker.py points TORCHINDUCTOR_CACHE_DIR at .cache/torchinductor.
+JIT_DIRS = [".cache/vllm", ".cache/flashinfer", ".triton", ".cache/torchinductor"]
+JIT_FORMAT = 2  # bump when JIT_DIRS changes so old caches are not reused
 
 
 def log(msg: str) -> None:
@@ -55,7 +57,7 @@ def prepare(a) -> None:
     torch_v = sh("python3 -c 'import torch; print(torch.__version__)'").replace("+", "-")
     packages = sorted(a.packages.split())
     venv_key = f"venv-{a.venv}-{short_hash(' '.join(packages))}-py{py}-torch{torch_v}.tar"
-    jit_key = f"jit-{a.jit}-{short_hash(venv_key)}.tar" if a.jit else None
+    jit_key = f"jit-{a.jit}-{short_hash(venv_key)}-v{JIT_FORMAT}.tar" if a.jit else None
     st = {"venv_key": venv_key, "jit_key": jit_key, "venv_restored": False, "jit_restored": False}
 
     t = time.time()

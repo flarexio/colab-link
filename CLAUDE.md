@@ -1,7 +1,7 @@
 # colab-link
 
 Goal: run Python jobs on rented Colab GPUs on demand: start a session → set up the environment (cached) → run → return results → stop the VM. The main uses are LLM processing and OCR with a multimodal LLM, but **it is not limited to batch jobs**; any Python job script works.
-Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ **CLI (current; the HTTP API comes later)** → ④ HTTP API.
+Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (done) → ③.5 NATS edge worker + **service mode/warm workers/container (current)** → ④ HTTP API (upload to Drive + call `run`).
 
 **Keep this file updated**: whenever you verify a new fact, hit a pitfall, or make a design decision, write it here so the next session can pick it up.
 
@@ -91,6 +91,9 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ **CLI (c
 - `colab_link/nats_runner.py`: **default transport**. `run_job_nats()` = tar input → Drive `colab-link-jobs/job-<id>-in.tar.gz` → new VM → upload the agent and secrets → launch `worker.py` → wait for `.ready` → request `.job` → receive `.log/.progress/.heartbeat` → `.result` → fetch output from Drive → stop VM (always) → delete the job files on Drive (unless `--keep-files`). No heartbeat for 90 s ⇒ VM presumed dead and stopped.
 - `colab_link/worker.py` (on the VM, edge worker): see its docstring for the subject list. One job at a time; `.ctl` accepts `drive_token` (the token is refreshed every 40 min over NATS) and `shutdown`.
 - `colab_link/runner.py`: the old exec-polling transport (`run --transport exec`), kept as a fallback.
+- `colab_link/service.py`: **`colab-link serve`** (the server-side service; see the "Service mode" section). `colab_link/client.py`: submit/fetch/status for the CLI.
+- `colab_link/jobhost.py` (on the VM): keeps a job module that defines `handle(in_dir, out_dir)` loaded, so a warm worker loads the model only once.
+- `Dockerfile` / `compose.yaml`: container for the service (image `flarexio/colab-link`).
 - `colab_link/vm_env.py` (on the VM): restores or builds the venv and JIT caches, and uploads anything new after the job.
 - `colab_link/drive_vm.py` (VM or local): Drive API ls/put/get/rm.
 - `jobs/vlm_batch.py`: vLLM batch over `tasks.jsonl` (text or text + image) → `results.jsonl` + `metrics.json`.
@@ -124,6 +127,44 @@ bin/colab-link sessions | stop-all | usage                # sessions on the serv
   - The vLLM log shows many `triton_bundler ... Cubin file ... not found at /tmp/torchinductor_root/...` messages: these are **warnings** (W) and do not affect results. The torch inductor cache in `/tmp/torchinductor_root` is not in the JIT cache yet; **adding it should save more of the compile time** (to try next).
 - 2026-10-14 **CLI end-to-end verified**: `run qwen35-9b-l4 --input examples/bench`. The venv key and JIT key computed on the VM both hit the cache; 100/100 correct; 596 s total.
   - **A poll exec sometimes loses its reply** (3 times in this run); the CLI waits out the whole timeout, so the runner noticed about 2 minutes after the job ended. The poll is now `timeout=20, retries=1`. **The real fix is to switch to NATS push (see below).**
+
+## Service mode (`colab-link serve`, 2026-10-14)
+- **Architecture**: a long-running service (on the user's cloud server, in a container) = NATS micro service (`micro.AddService`, same pattern as claude-runner) + a JetStream work queue + warm Colab workers.
+  - Endpoints (group `edges.<edge>.colab-link`): `run` {profile|gpu, script?, env?, pip?, cache?, idle_minutes?, **in_file**} → job record; `status` {job_id} or {} (recent 50); `cancel` {job_id}; `workers`.
+  - `in_file` is a tar.gz the caller has already put in `Drive:colab-link-jobs` (later the HTTP API will upload it for the user; files never go over NATS).
+  - JetStream: stream `COLAB_LINK_<edge>` (WorkQueue, subjects `edges.<edge>.colab-link.queue.<pool>`, max_age 7 days); KV `colab-link-<edge>`: `jobs.<id>` (job records, written by both the service and the workers), `pools.<pool>` (pool specs, which workers read at startup).
+  - **Pool** = everything that must match for a worker to take a job: GPU + script + env + venv + pip; `pool_id = <profile>-<sha8>`. Each pool has one durable pull consumer (`pool-<id>`, ack_wait 180 s, max_deliver 3; the worker sends `in_progress` every 60 s).
+  - Scaling: every 5 s the service checks each pool's `num_pending`; if there aren't enough idle workers and the pool is under `max_workers` (profile, default 1), it starts a VM. Limits: 2 per GPU type, 5 in total. When capacity is full, it asks an idle worker of another pool on the same GPU type to leave. A failed start backs off for 120 s.
+  - VM stop conditions: the worker is idle for `idle_minutes` (profile, default 10) → `.bye` → the service runs `colab stop`; no heartbeat for 90 s → presumed dead, stopped, and the job goes back to `queued` (JetStream redelivers it after ack_wait); the service receives SIGTERM → it **stops every VM** (so a container restart doesn't leave billing VMs behind).
+  - On restart the service **adopts** workers that are still heartbeating (it recognizes its own state files in `COLAB_LINK_STATE`); 30 s after startup, any VM with a state file but no heartbeat is stopped.
+  - Drive token: refreshed every 40 minutes and broadcast to all workers over `.ctl`. Job files nobody collects are deleted from Drive after 2 days.
+- **Warm job contract**: if the script defines `def handle(in_dir, out_dir)` (at the start of a line), the worker keeps it loaded through `jobhost.py`, so module globals (such as a loaded LLM) survive between jobs. Otherwise each job runs `python job.py in out`. `jobs/vlm_batch.py` and `jobs/hello.py` both have `handle()`.
+- CLI: `serve` / `submit PROFILE --input DIR [--wait] [--idle-minutes N]` / `jobs [ID]` / `fetch ID` / `cancel ID` / `workers`. `submit` does the Drive upload itself (it stands in for the future HTTP API).
+- **Verified (CPU, `hello-cpu`)**:
+  - Cold start, submit to done: 73 s (worker ready at 49 s).
+  - **Warm jobs: submit to done 23 s, run in the same process** (`pid` unchanged, `calls` 2 → 3); two jobs submitted at the same time were queued and run one after the other.
+  - `kill -9` the service and restart: the running worker was adopted.
+  - Cancelling a running job: killed within a few seconds, exit 130, status `cancelled`.
+  - After the idle timeout the workers sent bye and the service stopped the VMs, leaving 0 sessions on Colab.
+- **Container**: `Dockerfile` (multi-stage, python:3.13-slim; `google-colab-cli` installed from the `server` extra into the same venv; `COLAB_CLI_PYTHON` points at it). **336 MB** (uncompressed, arm64).
+  - pyarrow (~150 MB, pulled in by jupyter-kernel-client) is removed; the colab CLI doesn't use it.
+  - Volumes: `~/.flarex/colab-link` (ro), `~/.config/colab-cli` (OAuth token; the CLI refreshes it in place, so it must be writable), `/data` (state).
+  - Verified: submit → VM → done inside the container works; `docker stop` stopped the VM in 7 s before exiting. **Run with `--user <uid>` when testing locally** so the token files don't become root-owned.
+  - The container defaults to UTC (job ids and log times are UTC); set `TZ` if needed.
+  - On this machine docker requires `sudo` (jarvis is not in the docker group). The image built here is arm64. If the cloud server is amd64, build it there or use `docker buildx --platform linux/amd64`.
+- **Pitfalls**: with nats-py 2.16 + server 2.11, `kv.keys(filters=["jobs.*"])` returns nothing, so the service lists all keys and filters them itself. **`pkill -f`/`pgrep -f 'colab_link serve'` also match the Bash tool's own shell** (its command line contains the same string, so the shell gets killed too, exit 144). Use `ps -eo pid,comm,args | awk '$2 ~ /^python/ && /colab_link serve/'` to find the PID; better still, run serve in the background and have it write its own PID file (to do). Bash tool calls are capped at 10 minutes, so for long jobs submit without `--wait` and collect the result with `fetch` afterwards.
+- **Verified (L4, qwen35-9b-l4, examples/bench with 200 tasks, 2026-10-14)**:
+
+| Case | Submit to done | Model load | Generation | Correct |
+|---|---|---|---|---|
+| Cold start (rebuilding JIT v2) | ~10 min | 500 s | 19.8 s | 100/100 |
+| **Warm (same VM, 2nd job)** | **33 s** | **0 s** | 19.6 s | 100/100 |
+| Cold start (JIT v2 incl. inductor cache hit) | ~6.5 min | **219 s** (was 304 s) | — | 100/100 |
+
+  - Cold-start breakdown: VM + worker ready 59 s, env (venv + JIT restore) 65 s, job 240 s, output 3.5 s.
+  - **Adding the inductor cache cut model load from 304 s to 219 s**, about 85 s saved per cold start.
+  - Total CU spent on these tests (including CPU tests): about 0.5 (195.48 → 194.98).
+- The JIT cache now also includes the torch inductor cache (`TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor`); the key gained `-v2`, so the first run rebuilds it.
 
 ## NATS (FlareX edge convention)
 - The user's server: `wss://nats.flarex.io` (JetStream + TLS, **decentralized JWT**).

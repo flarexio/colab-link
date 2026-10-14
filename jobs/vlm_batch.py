@@ -1,6 +1,8 @@
 """Batch LLM / multimodal (OCR) inference with vLLM. Runs ON the Colab VM.
 
     python job.py IN_DIR OUT_DIR
+or, on a warm worker (colab-link serve), handle(IN_DIR, OUT_DIR) once per job with
+the model loaded only on the first call.
 
 IN_DIR/tasks.jsonl, one task per line:
     {"id": "a1", "prompt": "Summarise ...."}
@@ -22,6 +24,7 @@ from pathlib import Path
 
 MODEL = os.environ.get("MODEL", "Qwen/Qwen3-VL-4B-Instruct")
 out_dir: Path
+_llm = None  # kept across handle() calls on a warm worker
 
 
 def progress(stage, **kw):
@@ -34,27 +37,36 @@ def data_url(path: Path) -> str:
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
-def main():
+def load_llm():
+    global _llm
+    if _llm is None:
+        from vllm import LLM  # noqa: E402  (import is slow; time it)
+
+        _llm = LLM(
+            model=MODEL,
+            max_model_len=int(os.environ.get("MAX_MODEL_LEN", "8192")),
+            gpu_memory_utilization=float(os.environ.get("GPU_MEM_UTIL", "0.90")),
+            limit_mm_per_prompt={"image": 1},
+            enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
+            quantization=os.environ.get("QUANTIZATION") or None,  # e.g. "fp8" = on-the-fly on L4/G4
+            max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "256")),
+        )
+    return _llm
+
+
+def handle(in_dir: Path, out_dir_: Path):
     # vLLM may start its engine with multiprocessing 'spawn' (seen on G4/Blackwell),
-    # which re-imports this file, so all work must sit behind the __main__ guard.
+    # which re-imports the main module, so all work must sit behind the __main__ guard.
     global out_dir
-    in_dir, out_dir = Path(sys.argv[1]), Path(sys.argv[2])
+    out_dir = out_dir_
     out_dir.mkdir(parents=True, exist_ok=True)
     tasks = [json.loads(l) for l in (in_dir / "tasks.jsonl").read_text().splitlines() if l.strip()]
-    progress("loading", model=MODEL, tasks=len(tasks))
+    progress("loading", model=MODEL, tasks=len(tasks), warm=_llm is not None)
 
     t0 = time.time()
-    from vllm import LLM, SamplingParams  # noqa: E402  (import is slow; time it)
+    from vllm import SamplingParams  # noqa: E402
 
-    llm = LLM(
-        model=MODEL,
-        max_model_len=int(os.environ.get("MAX_MODEL_LEN", "8192")),
-        gpu_memory_utilization=float(os.environ.get("GPU_MEM_UTIL", "0.90")),
-        limit_mm_per_prompt={"image": 1},
-        enforce_eager=os.environ.get("ENFORCE_EAGER", "0") == "1",
-        quantization=os.environ.get("QUANTIZATION") or None,  # e.g. "fp8" = on-the-fly on L4/G4
-        max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "256")),
-    )
+    llm = load_llm()
     # Qwen3.5+ think by default; OCR/extraction wants the plain answer.
     THINKING = os.environ.get("ENABLE_THINKING", "0") == "1"
     load_s = time.time() - t0
@@ -96,4 +108,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    handle(Path(sys.argv[1]), Path(sys.argv[2]))

@@ -1,12 +1,16 @@
 [project]
 name = "colab-link"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run Python jobs on rented Colab GPUs with cached environments (FlareX edge service)"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "nats-py[nkeys]>=2.9",
     "aiohttp>=3.9",  # nats-py needs it for wss://
 ]
+
+[project.optional-dependencies]
+# The container runs the colab CLI from the same venv (COLAB_CLI_PYTHON).
+server = ["google-colab-cli==0.7.4"]
 
 [project.scripts]
 colab-link = "colab_link.cli:main"

@@ -23,3 +23,8 @@ gpu = "G4"
 venv = "vllm"
 job = "jobs/vlm_batch.py"
 env = { MODEL = "Qwen/Qwen3.8-27B-FP8", GPU_MEM_UTIL = "0.90", MAX_MODEL_LEN = "8192" }
+
+# Smoke test for the service and warm workers (CPU VM, ~0.08 CU/h).
+[profiles.hello-cpu]
+job = "jobs/hello.py"
+idle_minutes = 3

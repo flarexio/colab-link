@@ -41,6 +41,27 @@ print("LAUNCHED")
 """
 
 
+def launch_agent(sess: ColabSession, vm: str, gpu: str | None, drive_project: str, cache_root: str,
+                 jobs_root: str, token: str, extra_env: dict | None = None, flarex: Path = FLAREX) -> None:
+    """Ship worker.py + helpers + secrets to a READY VM and start the worker detached."""
+    sess.exec(f"import os; os.makedirs({AGENT!r}, exist_ok=True)")
+    here = Path(__file__).parent
+    with tempfile.TemporaryDirectory() as tmp:
+        tok = Path(tmp) / "drive_token"
+        tok.write_text(token)
+        # Secrets go up as files, never inside exec code (the CLI logs executed code).
+        for local, remote in [(flarex / "user.creds", ".nats.creds"), (flarex / "id", "id"),
+                              (tok, ".drive_token"), (here / "worker.py", "worker.py"),
+                              (here / "jobhost.py", "jobhost.py"), (here / "drive_vm.py", "drive_vm.py"),
+                              (here / "vm_env.py", "vm_env.py")]:
+            sess.upload(local, f"{AGENT}/{remote}")
+    agent_env = {"VM_ID": vm, "NATS_URL": NATS_URL, "GPU": gpu or "",
+                 "DRIVE_QUOTA_PROJECT": drive_project, "DRIVE_ROOT": cache_root,
+                 "DRIVE_JOBS_ROOT": jobs_root, "DRIVE_TOKEN_FILE": f"{AGENT}/.drive_token",
+                 **(extra_env or {})}
+    sess.exec(LAUNCH.format(agent=AGENT, env=agent_env), 120)
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
@@ -110,19 +131,8 @@ async def run_job_nats(job: Path, input_dir: Path, out_dir: Path, gpu: str | Non
             await asyncio.to_thread(sess.wait_ready)
             timings["provision_s"] = round(time.time() - t0 - timings["input_upload_s"], 1)
 
-            await asyncio.to_thread(sess.exec, f"import os; os.makedirs({AGENT!r}, exist_ok=True)")
-            tok = Path(tmp) / "drive_token"
-            tok.write_text(os.environ["DRIVE_TOKEN"])
-            here = Path(__file__).parent
-            # Secrets go up as files, never inside exec code (the CLI logs executed code).
-            for local, remote in [(FLAREX / "user.creds", ".nats.creds"), (FLAREX / "id", "id"),
-                                  (tok, ".drive_token"), (here / "worker.py", "worker.py"),
-                                  (here / "drive_vm.py", "drive_vm.py"), (here / "vm_env.py", "vm_env.py")]:
-                await asyncio.to_thread(sess.upload, local, f"{AGENT}/{remote}")
-            agent_env = {"VM_ID": vm, "NATS_URL": NATS_URL, "GPU": gpu or "",
-                         "DRIVE_QUOTA_PROJECT": drive_project, "DRIVE_ROOT": cache_root,
-                         "DRIVE_JOBS_ROOT": jobs_root, "DRIVE_TOKEN_FILE": f"{AGENT}/.drive_token"}
-            await asyncio.to_thread(sess.exec, LAUNCH.format(agent=AGENT, env=agent_env), 120)
+            await asyncio.to_thread(launch_agent, sess, vm, gpu, drive_project, cache_root, jobs_root,
+                                    os.environ["DRIVE_TOKEN"])
             try:
                 await asyncio.wait_for(ready.wait(), READY_TIMEOUT_S)
             except asyncio.TimeoutError:

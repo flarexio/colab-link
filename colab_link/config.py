@@ -19,6 +19,8 @@ class Profile:
     packages: list[str]
     job: str | None
     env: dict[str, str] = field(default_factory=dict)
+    idle_minutes: float = 10   # serve: a warm worker leaves after this long without jobs
+    max_workers: int = 1       # serve: VMs per pool (Colab allows 2 per GPU type)
 
     def jit_id(self, env: dict[str, str]) -> str:
         """Compiled kernels depend on model, quantization, limits and GPU."""
@@ -45,7 +47,9 @@ def load(path: str | None = None) -> Config:
             raise ValueError(f"profile {name}: unknown venv {venv!r}")
         profiles[name] = Profile(name=name, gpu=p.get("gpu"), venv=venv,
                                  packages=list(venvs.get(venv, {}).get("packages", [])),
-                                 job=p.get("job"), env={k: str(v) for k, v in p.get("env", {}).items()})
+                                 job=p.get("job"), env={k: str(v) for k, v in p.get("env", {}).items()},
+                                 idle_minutes=float(p.get("idle_minutes", 10)),
+                                 max_workers=int(p.get("max_workers", 1)))
     drive = raw.get("drive", {})
     return Config(drive_project=drive.get("project"), drive_root=drive.get("root", "colab-link-cache"),
                   drive_jobs_root=drive.get("jobs_root", "colab-link-jobs"), profiles=profiles)

@@ -5,6 +5,11 @@
     colab-link run --gpu T4 --job my.py --input DIR --pip pandas      (no profile)
     colab-link cache ls | cache rm NAME ...
     colab-link sessions | stop-all | usage
+
+Service mode (warm workers fed from a JetStream queue):
+    colab-link serve
+    colab-link submit qwen35-9b-l4 --input DIR [--wait] [--out DIR]
+    colab-link jobs [JOB_ID] | fetch JOB_ID | cancel JOB_ID | workers
 """
 from __future__ import annotations
 
@@ -83,6 +88,60 @@ def cmd_run(cfg, a):
                    drive_root=cfg.drive_root)
 
 
+def cmd_serve(cfg, a):
+    from .service import main as serve
+    return serve(cfg)
+
+
+def cmd_submit(cfg, a):
+    import asyncio
+    from .client import submit
+    if a.profile and a.profile not in cfg.profiles:
+        sys.exit(f"unknown profile {a.profile!r}; see `colab-link profiles`")
+    if not a.profile and not a.job:
+        sys.exit("pass a profile or --job")
+    req = {"profile": a.profile, "gpu": a.gpu, "env": dict(kv.split("=", 1) for kv in a.env),
+           "pip": a.pip, "cache": not a.no_cache, "idle_minutes": a.idle_minutes}
+    if a.job:
+        req["script"] = Path(a.job).read_text()
+    return asyncio.run(submit(cfg, req, a.input, a.out, a.wait))
+
+
+def cmd_jobs(cfg, a):
+    import asyncio
+    from .client import call
+    res = asyncio.run(call("status", {"job_id": a.job_id} if a.job_id else {}))
+    if a.job_id:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return
+    for r in res:
+        t = time.strftime("%m-%d %H:%M", time.localtime(r.get("submitted_at", 0)))
+        print(f"{r['job_id']}  {t}  {r['status']:<9} {r['pool']:<26} {r.get('vm') or '-':<12} "
+              f"exit={r.get('exitcode', '-')}")
+
+
+def cmd_fetch(cfg, a):
+    import asyncio
+    from .client import fetch
+    return asyncio.run(fetch(cfg, a.job_id, a.out))
+
+
+def cmd_cancel(cfg, a):
+    import asyncio
+    from .client import call
+    print(json.dumps(asyncio.run(call("cancel", {"job_id": a.job_id})), indent=2))
+
+
+def cmd_workers(cfg, a):
+    import asyncio
+    from .client import call
+    ws = asyncio.run(call("workers", {}))
+    for w in ws:
+        print(f"{w['vm']:<12} {w['gpu'] or 'CPU':<5} {w['state']:<9} {w['pool']:<26} "
+              f"job={w['job_id'] or '-'} up={w['up_s']}s")
+    print(f"{len(ws)} worker(s)")
+
+
 def cmd_cache(cfg, a):
     d = _drive(cfg)
     if a.action == "ls":
@@ -146,6 +205,27 @@ def main(argv=None) -> None:
     r.add_argument("--keep-files", action="store_true",
                    help="nats: keep the job's input/output files on Drive")
 
+    sub.add_parser("serve", help="run the service: NATS endpoints, job queue, warm workers")
+    sm = sub.add_parser("submit", help="queue a job on `colab-link serve` (warm workers)")
+    sm.add_argument("profile", nargs="?", help="profile name from profiles.toml")
+    sm.add_argument("--input", type=Path, required=True, help="directory shipped to the VM as ./in")
+    sm.add_argument("--out", type=Path, help="with --wait: output dir (default results/<profile>-<job>)")
+    sm.add_argument("--job", help="job script (overrides the profile's)")
+    sm.add_argument("--gpu", help="T4 | L4 | A100 | G4 (overrides the profile's)")
+    sm.add_argument("--env", action="append", default=[], help="KEY=VALUE for the job (repeatable)")
+    sm.add_argument("--pip", action="append", default=[], help="extra package to install (repeatable)")
+    sm.add_argument("--no-cache", action="store_true", help="skip Drive caches")
+    sm.add_argument("--idle-minutes", type=float, help="warm worker idle timeout (default: profile, 10)")
+    sm.add_argument("--wait", action="store_true", help="follow the job and download its output")
+    j = sub.add_parser("jobs", help="recent jobs on the service, or one job's record")
+    j.add_argument("job_id", nargs="?")
+    fe = sub.add_parser("fetch", help="download a finished job's output (and remove its Drive files)")
+    fe.add_argument("job_id")
+    fe.add_argument("--out", type=Path, help="output dir (default results/<profile>-<job>)")
+    cn = sub.add_parser("cancel", help="cancel a queued or running job")
+    cn.add_argument("job_id")
+    sub.add_parser("workers", help="warm workers of the service")
+
     c = sub.add_parser("cache", help="Drive cache files")
     csub = c.add_subparsers(dest="action", required=True)
     csub.add_parser("ls")
@@ -159,5 +239,7 @@ def main(argv=None) -> None:
     a = ap.parse_args(argv)
     cfg = config.load(a.profiles)
     handler = {"profiles": cmd_profiles, "run": cmd_run, "cache": cmd_cache,
-               "sessions": cmd_sessions, "stop-all": cmd_stop_all, "usage": cmd_usage}[a.cmd]
+               "sessions": cmd_sessions, "stop-all": cmd_stop_all, "usage": cmd_usage,
+               "serve": cmd_serve, "submit": cmd_submit, "jobs": cmd_jobs, "cancel": cmd_cancel, "fetch": cmd_fetch,
+               "workers": cmd_workers}[a.cmd]
     sys.exit(handler(cfg, a) or 0)

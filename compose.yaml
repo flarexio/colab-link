@@ -1,0 +1,13 @@
+services:
+  colab-link:
+    image: flarexio/colab-link
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ~/.flarex/colab-link:/root/.flarex/colab-link:ro   # id + user.creds (FlareX edge)
+      - ~/.config/colab-cli:/root/.config/colab-cli        # colab CLI OAuth token (refreshed in place)
+      - colab-link-state:/data                             # per-VM CLI state, to stop VMs after a restart
+    stop_grace_period: 2m   # SIGTERM stops every warm VM before exit
+
+volumes:
+  colab-link-state:
