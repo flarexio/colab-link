@@ -1,7 +1,7 @@
 # colab-link
 
-Goal: a batch-processing tool that can be called through an API. Each call starts a Colab GPU session, runs the task (LLM processing, or OCR with a multimodal LLM), returns the results, and stops the session.
-Phase 1 (current): prove the Colab side works. Phase 2: add the API layer.
+Goal: run Python jobs on rented Colab GPUs on demand: start a session → set up the environment (cached) → run → return results → stop the VM. The main uses are LLM processing and OCR with a multimodal LLM, but **it is not limited to batch jobs**; any Python job script works.
+Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ **CLI (current; the HTTP API comes later)** → ④ HTTP API.
 
 **Keep this file updated**: whenever you verify a new fact, hit a pitfall, or make a design decision, write it here so the next session can pick it up.
 
@@ -52,7 +52,7 @@ Phase 1 (current): prove the Colab side works. Phase 2: add the API layer.
 - Do not run `repl`, `console`, `auth` or `drivemount` interactively; they need a TTY.
 - VM image (2026-10): Python 3.13, torch 2.11 + cu130, transformers 5.18; **vLLM is not preinstalled**. About 207 GB of disk.
 
-## Google Drive (2026-10-14, in progress)
+## Google Drive (2026-10-14)
 - **`colab drivemount` (DriveFS) cannot be automated**: it uses Colab's credentials propagation (`dfs_ephemeral`). The authorization URL carries the VM's `endpoint`, so **every new VM needs a human to grant access once**. It also needs the same CLI process to stay open and wait for Enter after the grant (it reads `/dev/tty`); we have no TTY, so the process just fails and the next attempt generates new temporary credentials, making the earlier grant useless. Tried twice; both failed. ⇒ Do not use mounting.
 - **Use the Drive REST API directly instead**: `tools/drive_token.py` (run with the CLI venv's python) obtains an access token from the CLI's own oauth2 login. Its scopes include `drive.file`, which can only access files created by this OAuth client — enough for a model/environment cache, with no further authorization needed.
   - That token belongs to the Google Cloud SDK client, so calling the Drive API **requires the header `x-goog-user-project: <GCP project>`**, and that project must have the Drive API enabled.
@@ -84,21 +84,45 @@ Phase 1 (current): prove the Colab side works. Phase 2: add the API layer.
   - Next optimizations to try: lower the multimodal profiling cost (vLLM's `skip_mm_profiling`, or limit image size); drop packages from the venv that already match the system's to shrink the 8.3 GB; make cache restore and save a built-in runner option instead of hand-written `--setup`/`--post`.
 
 ## Layout
-- `colab_link/session.py`: `ColabSession`, a thin wrapper around the CLI (start/exec/upload/download/stop; context manager).
-- `colab_link/runner.py`: one job end to end: new → upload `job.py` + `in.tar.gz` → detached launch (`pip install` + `python job.py in out`, exit code written to `exitcode`) → poll `exitcode`, `out/progress.json` and the tail of `log.txt` → download `out.tar.gz` → stop. Writes `run.json` with the timing breakdown.
-- `jobs/vlm_batch.py`: runs on the VM. vLLM batch over `tasks.jsonl` (text, or text + image), producing `results.jsonl` and `metrics.json`. Model is chosen with env `MODEL`.
-- `examples/make_ocr_demo.py`: generates synthetic OCR images and tasks (`uv run --no-project --with pillow ...`; prefix with `env -u PYTHONPATH`).
-- `probe/probe_env.py`: probes VM hardware, preinstalled packages and download speed. `probe/stability.py`: connection stability. `probe/concurrency.py`: concurrency limit.
-- `tools/claude_usage.py`: Claude usage check.
+- `bin/colab-link` → `colab_link/cli.py`: user entry point (profiles / run / cache / sessions / stop-all / usage).
+- `profiles.toml` + `colab_link/config.py`: profiles, venv definitions, Drive settings.
+- `colab_link/session.py`: `ColabSession`, a thin wrapper around the CLI (start/wait_ready/exec/upload/download/stop/forget). Each job has its own state file under `~/.cache/colab-link/state/`; it is deleted once the session ends. `drive_token()` gets a token from the CLI login.
+- `colab_link/runner.py`: `run_job()` runs one job end to end: new → upload job.py, in.tar.gz and the VM helpers → detached launch (setup → pip → job → post; exit code written to `exitcode`) → poll (Drive token refreshed every 40 min) → download out.tar.gz → stop. Writes `run.json`.
+- `colab_link/vm_env.py` (on the VM): restores or builds the venv and JIT caches, and uploads anything new after the job.
+- `colab_link/drive_vm.py` (VM or local): Drive API ls/put/get/rm.
+- `jobs/vlm_batch.py`: vLLM batch over `tasks.jsonl` (text or text + image) → `results.jsonl` + `metrics.json`.
+- `jobs/build_env_cache.py`: early venv cache experiment (replaced by vm_env.py).
+- `examples/`: `make_bench.py` (100 OCR + 100 JSON tasks), `make_ocr_demo.py`, `score.py`. Generate data with `env -u PYTHONPATH uv run --no-project --with pillow ...`.
+- `probe/`: `probe_env.py` (VM hardware, packages, download speed), `stability.py`, `concurrency.py`.
+- `tools/claude_usage.py` (Claude usage), `tools/drive_token.py` (run with the CLI venv's python).
 - Version control: git, `main` branch, remote `git@github.com:flarexio/colab-link.git` (private). `results/`, `logs/` and generated test data are not committed (see `.gitignore`); write important numbers into this file.
 
-## Running
+## Running (CLI: `bin/colab-link`)
 ```bash
-python3 -m colab_link.runner --gpu L4 --job jobs/vlm_batch.py \
-  --input examples/ocr_demo --out results/demo-l4 \
-  --pip vllm --env MODEL=Qwen/Qwen3-VL-4B-Instruct
+bin/colab-link profiles                                   # list profiles (profiles.toml)
+bin/colab-link run qwen35-9b-l4 --input examples/bench    # output defaults to results/<profile>-<time>
+bin/colab-link run qwen35-9b-l4 --input DIR --env MAX_MODEL_LEN=4096 --dry-run   # print the plan only
+bin/colab-link run --gpu T4 --job my.py --input DIR --pip pandas                  # no profile: any script
+bin/colab-link cache ls | cache rm NAME...                # caches on Drive
+bin/colab-link sessions | stop-all | usage                # sessions on the server / stop leftover VMs / CU balance
 ```
-The local orchestrator uses only the Python standard library.
+- `bin/colab-link` runs `python3 -m colab_link` with `PYTHONPATH` cleared; the orchestrator uses only the Python standard library (3.11+, because of `tomllib`).
+- **Job contract**: `job.py IN_DIR OUT_DIR`. The whole `--input` directory is sent to the VM as `in/`, and everything the job writes to `out/` comes back to `--out` (along with `log.txt`, `env_state.json`, `run.json`). The job must put its work behind `if __name__ == "__main__"`.
+- **Profile** = GPU + venv + default job + env. Profiles that have a venv automatically go through `vm_env.py prepare/finalize`:
+  - venv cache key: `venv-<name>-<sha(packages)>-py<ver>-torch<ver>.tar` (computed on the VM, so it changes with the image).
+  - JIT cache key: `jit-<profile>-<sha(gpu+env)>-<sha(venv key)>.tar`. Changing the model or parameters with `--env` gives a new key automatically.
+  - If a cache is missing, it is built on the spot; after the job **succeeds**, it is uploaded to Drive (a venv upload takes about 270 s, once only). `--no-cache` turns this off.
+- The low-level `python3 -m colab_link.runner` is still available (hand-written `--setup/--post/--python/--drive`).
+- 2026-10-14 **CLI end-to-end verified**: `run qwen35-9b-l4 --input examples/bench`. The venv key and JIT key computed on the VM both hit the cache; 100/100 correct; 596 s total.
+  - **A poll exec sometimes loses its reply** (3 times in this run); the CLI waits out the whole timeout, so the runner noticed about 2 minutes after the job ended. The poll is now `timeout=20, retries=1`. **The real fix is to switch to NATS push (see below).**
+
+## Next: NATS (in planning)
+- The user's server already runs NATS (JetStream + TLS, **decentralized JWT**), at `wss://nats.flarex.io`.
+- Architecture: the control plane stays on the colab CLI (start the VM, send the agent and credentials, stop); the data plane uses NATS (dispatch jobs, progress, logs, results, heartbeats). The VM has no public IP, so **the VM connects out**.
+- Main benefits: **warm workers** (a VM pulls jobs from a JetStream work queue continuously and only stops after N idle minutes, so the ~8-minute startup cost is paid once), push instead of polling, durable results, and an immediate `colab stop` when heartbeats stop.
+- **Credentials are never sent through Drive or chat**: the user places the creds file at `~/.config/colab-link/nats-test.creds` (chmod 600). It is never printed and is sent to the VM by uploading a file.
+- Proposed test user: `colab.>` pub/sub + `_INBOX.>`, 7-day expiry. Long term: colab-link holds an account signing key and **issues each VM a short-lived JWT scoped to `colab.worker.<id>.>`**.
+- Still to verify: whether a Colab VM can reach wss 443; and Colab's terms on long-lived connections to external services and background work.
 
 ## Validation log
 - 2026-10-14 **End-to-end success** (L4, Qwen3-VL-4B, 5 tasks): 391 s total ≈ 0.17 CU. 3/3 OCR outputs correct (only whitespace differed); Chinese summary and JSON extraction both correct.

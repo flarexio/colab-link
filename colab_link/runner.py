@@ -64,11 +64,13 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
             pip: list[str], env: dict[str, str], poll_s: float = 20,
             max_hours: float = 6, keep_log_lines: int = 5,
             setup: list[str] | None = None, python: str = "python",
-            drive_project: str | None = None, post: list[str] | None = None) -> int:
+            drive_project: str | None = None, post: list[str] | None = None,
+            drive_root: str = "colab-link-cache") -> int:
     name = f"cl-{uuid.uuid4().hex[:8]}"
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     timings: dict[str, float] = {}
+    status: dict = {}
 
     with tempfile.TemporaryDirectory() as tmp:
         tar_in = Path(tmp) / "in.tar.gz"
@@ -90,16 +92,22 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
                 sess.upload(local, remote)
                 log(f"uploaded {remote} ({local.stat().st_size / 1e6:.1f} MB) in {time.time() - t:.1f}s")
 
-            upload(job, f"{REMOTE}/job.py")
-            upload(tar_in, f"{REMOTE}/in.tar.gz")
-            if drive_project:
+            def push_token() -> None:
                 # Token goes up as a file, never inside exec code (the CLI logs code).
                 tok = Path(tmp) / "drive_token"
                 tok.write_text(drive_token())
                 tok.chmod(0o600)
                 upload(tok, f"{REMOTE}/.drive_token")
-                upload(Path(__file__).with_name("drive_vm.py"), f"{REMOTE}/drive_vm.py")
-                env = {**env, "DRIVE_QUOTA_PROJECT": drive_project,
+
+            upload(job, f"{REMOTE}/job.py")
+            upload(tar_in, f"{REMOTE}/in.tar.gz")
+            for helper in ("drive_vm.py", "vm_env.py"):
+                upload(Path(__file__).with_name(helper), f"{REMOTE}/{helper}")
+            token_t = 0.0
+            if drive_project:
+                push_token()
+                token_t = time.time()
+                env = {**env, "DRIVE_QUOTA_PROJECT": drive_project, "DRIVE_ROOT": drive_root,
                        "DRIVE_TOKEN_FILE": f"{REMOTE}/.drive_token"}
             timings["upload_s"] = time.time() - t0 - timings["provision_s"]
 
@@ -117,13 +125,21 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
             log("job launched; polling")
 
             deadline = time.time() + max_hours * 3600
-            status: dict = {}
             last_tail: list[str] = []
             poll_failures = 0
             while time.time() < deadline:
                 time.sleep(poll_s)
+                if drive_project and time.time() - token_t > 40 * 60:  # tokens last ~1 h
+                    try:
+                        push_token()
+                        token_t = time.time()
+                    except Exception as e:
+                        log(f"token refresh failed (will retry): {str(e)[-200:]}")
                 try:
-                    raw = sess.exec(POLL.format(remote=REMOTE, tail=keep_log_lines), timeout=60)
+                    # Short timeout: a lost kernel reply otherwise stalls the poll for a full
+                    # minute (seen ~3x per run); the next poll simply asks again.
+                    raw = sess.exec(POLL.format(remote=REMOTE, tail=keep_log_lines),
+                                    timeout=20, retries=1)
                     poll_failures = 0
                 except Exception as e:  # transient websocket hiccup: keep polling
                     poll_failures += 1
@@ -146,7 +162,8 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
                 log("max_hours reached; collecting whatever exists")
             timings["job_s"] = time.time() - t0 - timings["provision_s"] - timings["upload_s"]
 
-            sess.exec(f"import subprocess; subprocess.run('cp log.txt out/ && tar czf out.tar.gz -C out .', "
+            sess.exec(f"import subprocess; subprocess.run('cp log.txt out/; cp env_state.json out/ 2>/dev/null; "
+                      f"tar czf out.tar.gz -C out .', "
                       f"shell=True, cwd={REMOTE!r}, check=True)", timeout=300)
             tar_out = Path(tmp) / "out.tar.gz"
             sess.download(f"{REMOTE}/out.tar.gz", tar_out)
@@ -155,6 +172,7 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
         finally:
             log(f"stopping {name}")
             sess.stop()
+            sess.forget()
 
     timings["total_s"] = time.time() - t0
     exitcode = status.get("exitcode")

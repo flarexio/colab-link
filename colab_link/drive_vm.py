@@ -9,6 +9,7 @@ client created: everything lives under one folder, DRIVE_ROOT
     python drive_vm.py ls
     python drive_vm.py put LOCAL NAME
     python drive_vm.py get NAME LOCAL
+    python drive_vm.py rm NAME
 """
 from __future__ import annotations
 
@@ -27,6 +28,9 @@ CHUNK = 64 * 1024 * 1024
 
 
 def _token() -> str:
+    # Re-read every call: the runner swaps in a fresh token file during long jobs.
+    if os.environ.get("DRIVE_TOKEN"):
+        return os.environ["DRIVE_TOKEN"]
     return open(os.environ.get("DRIVE_TOKEN_FILE", "/content/run/.drive_token")).read().strip()
 
 
@@ -80,6 +84,13 @@ def find(name: str, parent: str | None = None) -> dict | None:
 
 def ls() -> list[dict]:
     return _q(f"'{root_id()}' in parents and trashed=false")
+
+
+def rm(name: str) -> bool:
+    meta = find(name)
+    if meta:
+        _req("DELETE", f"{API}/files/{meta['id']}").read()
+    return bool(meta)
 
 
 def put(local: str, name: str) -> dict:
@@ -143,6 +154,8 @@ if __name__ == "__main__":
         dt = time.time() - t
         print(f"put {sys.argv[3]}: {int(meta['size']) / 1e9:.2f} GB in {dt:.1f}s "
               f"({int(meta['size']) / 1e6 / dt:.0f} MB/s)")
+    elif cmd == "rm":
+        print(("removed " if rm(sys.argv[2]) else "not found: ") + sys.argv[2])
     elif cmd == "get":
         n = get(sys.argv[2], sys.argv[3])
         dt = time.time() - t

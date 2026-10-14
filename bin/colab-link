@@ -1,0 +1,5 @@
+#!/bin/sh
+# Entry point. The orchestrator is stdlib-only; PYTHONPATH is cleared so a
+# leaked Hermes path can't shadow anything (see CLAUDE.md).
+here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+exec env -u PYTHONPATH PYTHONPATH="$here" python3 -m colab_link "$@"

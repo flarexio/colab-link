@@ -1,0 +1,24 @@
+# colab-link profiles: a profile = GPU + venv + job + env.
+#   colab-link run <profile> --input DIR --out DIR [--env KEY=VALUE ...]
+# The venv and JIT caches on Drive are keyed automatically (see colab_link/vm_env.py).
+
+[drive]
+project = "flarex-439501"     # GCP quota project with the Drive API enabled
+root = "colab-link-cache"     # Drive folder (found by name; do not rename)
+
+[venvs.vllm]
+packages = ["vllm==0.31.0"]
+
+# Everyday OCR / extraction: cheapest, 100/100 on examples/bench (~0.21 CU per run with caches).
+[profiles.qwen35-9b-l4]
+gpu = "L4"
+venv = "vllm"
+job = "jobs/vlm_batch.py"
+env = { MODEL = "Qwen/Qwen3.5-9B", QUANTIZATION = "fp8", GPU_MEM_UTIL = "0.92", MAX_MODEL_LEN = "8192" }
+
+# Highest quality and fastest generation; ~1.1 CU per run (8.9 CU/h).
+[profiles.qwen38-27b-g4]
+gpu = "G4"
+venv = "vllm"
+job = "jobs/vlm_batch.py"
+env = { MODEL = "Qwen/Qwen3.8-27B-FP8", GPU_MEM_UTIL = "0.90", MAX_MODEL_LEN = "8192" }

@@ -5,6 +5,7 @@ fight over ~/.config/colab-cli/sessions.json.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -94,6 +95,15 @@ class ColabSession:
         if self.started:
             self.cli("stop", "-s", self.name, check=False, timeout=120)
             self.started = False
+
+    def forget(self) -> None:
+        """Delete the per-session state file once the CLI has emptied it."""
+        try:
+            if json.loads(self.state_file.read_text() or "{}") == {}:
+                self.state_file.unlink()
+                Path(f"{self.state_file}.lock").unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass
 
     def __enter__(self) -> "ColabSession":
         self.start()
