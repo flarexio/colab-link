@@ -59,7 +59,7 @@ Phase 1 (current): prove the Colab side works. Phase 2: add the API layer.
 - `examples/make_ocr_demo.py`: generates synthetic OCR images and tasks (`uv run --no-project --with pillow ...`; prefix with `env -u PYTHONPATH`).
 - `probe/probe_env.py`: probes VM hardware, preinstalled packages and download speed. `probe/stability.py`: connection stability. `probe/concurrency.py`: concurrency limit.
 - `tools/claude_usage.py`: Claude usage check.
-- Version control: git, `main` branch, no remote yet. `results/`, `logs/` and generated test data are not committed (see `.gitignore`); write important numbers into this file.
+- Version control: git, `main` branch, remote `git@github.com:flarexio/colab-link.git` (private). `results/`, `logs/` and generated test data are not committed (see `.gitignore`); write important numbers into this file.
 
 ## Running
 ```bash
