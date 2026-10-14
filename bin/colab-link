@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entry point. The orchestrator is stdlib-only; PYTHONPATH is cleared so a
-# leaked Hermes path can't shadow anything (see CLAUDE.md).
+# Entry point: runs the CLI in the project's uv venv. PYTHONPATH is cleared so a
+# leaked Hermes path can't shadow the venv's packages (see CLAUDE.md).
 here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-exec env -u PYTHONPATH PYTHONPATH="$here" python3 -m colab_link "$@"
+exec env -u PYTHONPATH uv run -q --project "$here" python -m colab_link "$@"

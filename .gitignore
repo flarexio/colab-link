@@ -8,3 +8,6 @@ logs/
 # Generated test data (rebuild with examples/make_*.py)
 examples/bench/
 examples/ocr_demo/
+
+# uv project venv
+.venv/

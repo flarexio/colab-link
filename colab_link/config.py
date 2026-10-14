@@ -30,6 +30,7 @@ class Profile:
 class Config:
     drive_project: str | None
     drive_root: str
+    drive_jobs_root: str
     profiles: dict[str, Profile]
 
 
@@ -47,4 +48,4 @@ def load(path: str | None = None) -> Config:
                                  job=p.get("job"), env={k: str(v) for k, v in p.get("env", {}).items()})
     drive = raw.get("drive", {})
     return Config(drive_project=drive.get("project"), drive_root=drive.get("root", "colab-link-cache"),
-                  profiles=profiles)
+                  drive_jobs_root=drive.get("jobs_root", "colab-link-jobs"), profiles=profiles)

@@ -3,8 +3,9 @@
 Uses the token the runner uploads (DRIVE_TOKEN_FILE, default
 /content/run/.drive_token) and the quota project in DRIVE_QUOTA_PROJECT.
 The token only has drive.file scope, so it sees just the files this OAuth
-client created: everything lives under one folder, DRIVE_ROOT
-(default "colab-link-cache"), addressed by flat names.
+client created. Files live flat inside named top-level folders: caches in
+DRIVE_ROOT (default "colab-link-cache"); callers pass folder= for others
+(e.g. "colab-link-jobs" for job inputs/outputs).
 
     python drive_vm.py ls
     python drive_vm.py put LOCAL NAME
@@ -68,36 +69,39 @@ def _q(q: str) -> list[dict]:
     return _json("GET", url)["files"]
 
 
-def root_id() -> str:
-    name = os.environ.get("DRIVE_ROOT", "colab-link-cache")
-    hits = _q(f"name='{name}' and mimeType='{FOLDER_MIME}' and trashed=false")
-    if hits:
-        return hits[0]["id"]
-    return _json("POST", f"{API}/files", {"name": name, "mimeType": FOLDER_MIME})["id"]
+_folders: dict[str, str] = {}
 
 
-def find(name: str, parent: str | None = None) -> dict | None:
-    parent = parent or root_id()
-    hits = _q(f"name='{name}' and '{parent}' in parents and trashed=false")
+def root_id(folder: str | None = None) -> str:
+    name = folder or os.environ.get("DRIVE_ROOT", "colab-link-cache")
+    if name not in _folders:
+        hits = _q(f"name='{name}' and mimeType='{FOLDER_MIME}' and trashed=false")
+        _folders[name] = hits[0]["id"] if hits else _json(
+            "POST", f"{API}/files", {"name": name, "mimeType": FOLDER_MIME})["id"]
+    return _folders[name]
+
+
+def find(name: str, folder: str | None = None) -> dict | None:
+    hits = _q(f"name='{name}' and '{root_id(folder)}' in parents and trashed=false")
     return hits[0] if hits else None
 
 
-def ls() -> list[dict]:
-    return _q(f"'{root_id()}' in parents and trashed=false")
+def ls(folder: str | None = None) -> list[dict]:
+    return _q(f"'{root_id(folder)}' in parents and trashed=false")
 
 
-def rm(name: str) -> bool:
-    meta = find(name)
+def rm(name: str, folder: str | None = None) -> bool:
+    meta = find(name, folder)
     if meta:
         _req("DELETE", f"{API}/files/{meta['id']}").read()
     return bool(meta)
 
 
-def put(local: str, name: str) -> dict:
+def put(local: str, name: str, folder: str | None = None) -> dict:
     """Resumable upload; replaces an existing file of the same name."""
-    parent = root_id()
+    parent = root_id(folder)
     size = os.path.getsize(local)
-    old = find(name, parent)
+    old = find(name, folder)
     if old:
         url = f"{UPLOAD}/files/{old['id']}?uploadType=resumable"
         init = _req("PATCH", url, b"{}", {"Content-Type": "application/json",
@@ -114,12 +118,12 @@ def put(local: str, name: str) -> dict:
             end = off + len(buf) - 1
             r = _req("PUT", session, buf, {"Content-Range": f"bytes {off}-{end}/{size}"})
             off = end + 1
-    return find(name, parent)
+    return find(name, folder)
 
 
-def get(name: str, local: str, workers: int = 16) -> int:
+def get(name: str, local: str, workers: int = 16, folder: str | None = None) -> int:
     """Parallel ranged download. Returns bytes written."""
-    meta = find(name)
+    meta = find(name, folder)
     if not meta:
         raise FileNotFoundError(name)
     size = int(meta["size"])

@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 VENV = "/content/venv"
-STATE = Path("/content/run/env_state.json")
+STATE = Path(os.environ.get("VM_ENV_STATE", "/content/run/env_state.json"))
 JIT_DIRS = [".cache/vllm", ".cache/flashinfer", ".triton"]  # relative to /root
 
 

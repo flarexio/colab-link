@@ -65,9 +65,19 @@ def cmd_run(cfg, a):
     plan = {"profile": a.profile, "gpu": gpu or "CPU", "job": str(job), "input": str(a.input),
             "out": str(out), "env": env, "pip": a.pip, "drive_cache": bool(drive_project),
             "setup": setup, "post": post, "python": python}
+    plan["transport"] = a.transport
     if a.dry_run:
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return 0
+    if a.transport == "nats":
+        import asyncio
+        from .nats_runner import run_job_nats
+        venv = ({"name": prof.venv, "packages": prof.packages,
+                 "jit": prof.jit_id({**env, "_gpu": gpu or "CPU"})} if prof and prof.venv else None)
+        return asyncio.run(run_job_nats(
+            job, a.input, Path(out), gpu, env, venv, a.pip, cfg.drive_project,
+            cache_root=cfg.drive_root, jobs_root=cfg.drive_jobs_root, max_hours=a.max_hours,
+            keep_files=a.keep_files, cache=not a.no_cache))
     return run_job(job, a.input, Path(out), gpu, a.pip, env, a.poll, a.max_hours,
                    setup=setup, python=python, drive_project=drive_project, post=post,
                    drive_root=cfg.drive_root)
@@ -130,6 +140,11 @@ def main(argv=None) -> None:
     r.add_argument("--poll", type=float, default=20, help="poll interval seconds (each poll ~5 s)")
     r.add_argument("--max-hours", type=float, default=6)
     r.add_argument("--dry-run", action="store_true", help="print the plan, do not rent a VM")
+    r.add_argument("--transport", choices=["nats", "exec"], default="nats",
+                   help="nats: worker agent over NATS + files via Drive (default); "
+                        "exec: legacy colab-exec polling + colab upload/download")
+    r.add_argument("--keep-files", action="store_true",
+                   help="nats: keep the job's input/output files on Drive")
 
     c = sub.add_parser("cache", help="Drive cache files")
     csub = c.add_subparsers(dest="action", required=True)

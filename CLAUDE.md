@@ -88,6 +88,9 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ **CLI (c
 - `profiles.toml` + `colab_link/config.py`: profiles, venv definitions, Drive settings.
 - `colab_link/session.py`: `ColabSession`, a thin wrapper around the CLI (start/wait_ready/exec/upload/download/stop/forget). Each job has its own state file under `~/.cache/colab-link/state/`; it is deleted once the session ends. `drive_token()` gets a token from the CLI login.
 - `colab_link/runner.py`: `run_job()` runs one job end to end: new → upload job.py, in.tar.gz and the VM helpers → detached launch (setup → pip → job → post; exit code written to `exitcode`) → poll (Drive token refreshed every 40 min) → download out.tar.gz → stop. Writes `run.json`.
+- `colab_link/nats_runner.py`: **default transport**. `run_job_nats()` = tar input → Drive `colab-link-jobs/job-<id>-in.tar.gz` → new VM → upload the agent and secrets → launch `worker.py` → wait for `.ready` → request `.job` → receive `.log/.progress/.heartbeat` → `.result` → fetch output from Drive → stop VM (always) → delete the job files on Drive (unless `--keep-files`). No heartbeat for 90 s ⇒ VM presumed dead and stopped.
+- `colab_link/worker.py` (on the VM, edge worker): see its docstring for the subject list. One job at a time; `.ctl` accepts `drive_token` (the token is refreshed every 40 min over NATS) and `shutdown`.
+- `colab_link/runner.py`: the old exec-polling transport (`run --transport exec`), kept as a fallback.
 - `colab_link/vm_env.py` (on the VM): restores or builds the venv and JIT caches, and uploads anything new after the job.
 - `colab_link/drive_vm.py` (VM or local): Drive API ls/put/get/rm.
 - `jobs/vlm_batch.py`: vLLM batch over `tasks.jsonl` (text or text + image) → `results.jsonl` + `metrics.json`.
@@ -106,13 +109,19 @@ bin/colab-link run --gpu T4 --job my.py --input DIR --pip pandas                
 bin/colab-link cache ls | cache rm NAME...                # caches on Drive
 bin/colab-link sessions | stop-all | usage                # sessions on the server / stop leftover VMs / CU balance
 ```
-- `bin/colab-link` runs `python3 -m colab_link` with `PYTHONPATH` cleared; the orchestrator uses only the Python standard library (3.11+, because of `tomllib`).
+- `bin/colab-link` runs `python -m colab_link` in the project's **uv venv** (`uv run --project`, with PYTHONPATH cleared). Dependencies: `pyproject.toml` (`nats-py[nkeys]`, `aiohttp`); `.venv/` is not committed.
+- **Division of labor (the user's design)**: files go through **Google Drive** (users upload over HTTP to the colab-link server, which writes them to Drive); **NATS carries only control messages** (which file to process, progress, results). Never send files over NATS.
+- NATS subjects: `edges.<edge>.colab-link.workers.<vm>.{ready,heartbeat,job,log,progress,result,status,ctl}` (consistent with the user's existing logic). The service endpoint planned later: `edges.<edge>.colab-link.{run,status,cancel}`.
 - **Job contract**: `job.py IN_DIR OUT_DIR`. The whole `--input` directory is sent to the VM as `in/`, and everything the job writes to `out/` comes back to `--out` (along with `log.txt`, `env_state.json`, `run.json`). The job must put its work behind `if __name__ == "__main__"`.
 - **Profile** = GPU + venv + default job + env. Profiles that have a venv automatically go through `vm_env.py prepare/finalize`:
   - venv cache key: `venv-<name>-<sha(packages)>-py<ver>-torch<ver>.tar` (computed on the VM, so it changes with the image).
   - JIT cache key: `jit-<profile>-<sha(gpu+env)>-<sha(venv key)>.tar`. Changing the model or parameters with `--env` gives a new key automatically.
   - If a cache is missing, it is built on the spot; after the job **succeeds**, it is uploaded to Drive (a venv upload takes about 270 s, once only). `--no-cache` turns this off.
 - The low-level `python3 -m colab_link.runner` is still available (hand-written `--setup/--post/--python/--drive`).
+- 2026-10-14 **NATS transport verified (CPU, jobs/hello.py)**: VM start → worker ready 44 s (including installing nats-py); progress and logs pushed with ~1 s delay; **the result arrived and the VM was stopped within 3 s of the job ending** (exec polling took at least 20 s, at worst +2 minutes); Drive job files cleaned up automatically.
+- 2026-10-14 **NATS transport verified (L4, qwen35-9b-l4, 200 tasks)**: **481 s total** (the exec transport took 596 s); 100/100 correct; both caches hit; the Drive jobs folder was cleaned up automatically.
+  - Breakdown: input upload 5.6 s, provisioning 11 s, agent ready 26.5 s, on-VM env (venv + JIT restore) 91 s, input 4 s, job 331 s (model load 303 s + generation 20 s), output 2.8 s + download 1.4 s.
+  - The vLLM log shows many `triton_bundler ... Cubin file ... not found at /tmp/torchinductor_root/...` messages: these are **warnings** (W) and do not affect results. The torch inductor cache in `/tmp/torchinductor_root` is not in the JIT cache yet; **adding it should save more of the compile time** (to try next).
 - 2026-10-14 **CLI end-to-end verified**: `run qwen35-9b-l4 --input examples/bench`. The venv key and JIT key computed on the VM both hit the cache; 100/100 correct; 596 s total.
   - **A poll exec sometimes loses its reply** (3 times in this run); the CLI waits out the whole timeout, so the runner noticed about 2 minutes after the job ended. The poll is now `timeout=20, retries=1`. **The real fix is to switch to NATS push (see below).**
 

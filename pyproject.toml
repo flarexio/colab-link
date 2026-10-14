@@ -1,0 +1,19 @@
+[project]
+name = "colab-link"
+version = "0.1.0"
+description = "Run Python jobs on rented Colab GPUs with cached environments (FlareX edge service)"
+requires-python = ">=3.11"
+dependencies = [
+    "nats-py[nkeys]>=2.9",
+    "aiohttp>=3.9",  # nats-py needs it for wss://
+]
+
+[project.scripts]
+colab-link = "colab_link.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["colab_link"]
