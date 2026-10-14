@@ -116,13 +116,21 @@ bin/colab-link sessions | stop-all | usage                # sessions on the serv
 - 2026-10-14 **CLI end-to-end verified**: `run qwen35-9b-l4 --input examples/bench`. The venv key and JIT key computed on the VM both hit the cache; 100/100 correct; 596 s total.
   - **A poll exec sometimes loses its reply** (3 times in this run); the CLI waits out the whole timeout, so the runner noticed about 2 minutes after the job ended. The poll is now `timeout=20, retries=1`. **The real fix is to switch to NATS push (see below).**
 
-## Next: NATS (in planning)
-- The user's server already runs NATS (JetStream + TLS, **decentralized JWT**), at `wss://nats.flarex.io`.
-- Architecture: the control plane stays on the colab CLI (start the VM, send the agent and credentials, stop); the data plane uses NATS (dispatch jobs, progress, logs, results, heartbeats). The VM has no public IP, so **the VM connects out**.
-- Main benefits: **warm workers** (a VM pulls jobs from a JetStream work queue continuously and only stops after N idle minutes, so the ~8-minute startup cost is paid once), push instead of polling, durable results, and an immediate `colab stop` when heartbeats stop.
-- **Credentials are never sent through Drive or chat**: the user places the creds file at `~/.config/colab-link/nats-test.creds` (chmod 600). It is never printed and is sent to the VM by uploading a file.
-- Proposed test user: `colab.>` pub/sub + `_INBOX.>`, 7-day expiry. Long term: colab-link holds an account signing key and **issues each VM a short-lived JWT scoped to `colab.worker.<id>.>`**.
-- Still to verify: whether a Colab VM can reach wss 443; and Colab's terms on long-lived connections to external services and background work.
+## NATS (FlareX edge convention)
+- The user's server: `wss://nats.flarex.io` (JetStream + TLS, **decentralized JWT**).
+- **FlareX convention (follow it)**: config directory `~/.flarex/colab-link/` holds `id` (the **edge id**, a ULID; it is also the JWT user name; the edge id is shared across products on this machine, e.g. claude-runner uses the same one) and `user.creds`.
+  - Subjects: **`edges.<edge id>.colab-link.>`** (same as claude-runner's `edges.<edge id>.claude-runner`; it is the same tenant's subject namespace).
+  - Connection name: `Colab Link - <edge id>` (the VM side uses `Colab Link VM - <edge id>`).
+  - claude-runner uses `micro.AddService` + `srv.AddGroup("edges.<id>.claude-runner")` to expose endpoints (source in `~/go/pkg/mod/github.com/flarexio/claude-runner@v1.0.6/cmd/claude-runner/main.go`).
+- **Permissions of this creds**: the JWT has no pub/sub restrictions and no expiry (issued 2025-06), so it has full permissions in the account. **Sending it to a VM is fine for testing; long term, colab-link should issue each VM a short-lived JWT scoped to `edges.<id>.colab-link.workers.<vm>.>`** (requires the account signing key).
+- **Never print or log the creds**; send them to the VM by uploading a file (chmod 600). Read only the JWT's public claims to inspect permissions.
+- Python: `nats-py[nkeys]` (without the nkeys extra, JWT login fails) + `aiohttp` (needed for wss). Subscription callbacks must be `async def`.
+- **2026-10-14 measurements** (`probe/nats_probe.py`):
+  - Local: connect 0.63 s, request/reply loopback ~20 ms.
+  - **Colab VM (CPU, us-east) connecting out over wss 443: works**. Connect 1.4 s; from starting the agent to ready 7.3 s (including installing nats-py). Local ↔ VM request/reply median **197 ms** / p95 198 ms. VM-pushed heartbeats arrive with ~103 ms latency.
+  - ⇒ Replacing the poll exec (~5 s each, sometimes stuck for 60 s) with NATS push is entirely feasible.
+- Architecture: the control plane stays on the colab CLI (start the VM, send the agent and credentials, stop); the data plane uses NATS (dispatch jobs, progress, logs, results, heartbeats). Main benefit: **warm workers** (pull jobs from a JetStream work queue continuously and only stop after N idle minutes, so the ~8-minute startup cost is paid once).
+- Still to check: Colab's terms on long-lived connections to external services and background work.
 
 ## Validation log
 - 2026-10-14 **End-to-end success** (L4, Qwen3-VL-4B, 5 tasks): 391 s total ≈ 0.17 CU. 3/3 OCR outputs correct (only whitespace differed); Chinese summary and JSON extraction both correct.
