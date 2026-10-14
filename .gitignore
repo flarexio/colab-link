@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Run outputs and logs (key numbers are recorded in CLAUDE.md)
+results/
+logs/
+
+# Generated test data (rebuild with examples/make_*.py)
+examples/bench/
+examples/ocr_demo/
