@@ -96,7 +96,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - `examples/`: `make_bench.py` (100 OCR + 100 JSON tasks), `make_ocr_demo.py`, `score.py`. Generate data with `env -u PYTHONPATH uv run --no-project --with pillow ...`.
 - `probe/`: `probe_env.py` (VM hardware, packages, download speed), `stability.py`, `concurrency.py`.
 - `tools/claude_usage.py` (Claude usage), `tools/drive_token.py` (run with the CLI venv's python).
-- Version control: git, `main` branch, remote `git@github.com:flarexio/colab-link.git` (private). `results/`, `logs/` and generated test data are not committed (see `.gitignore`); write important numbers into this file.
+- Version control: git, `main` branch, remote `git@github.com:flarexio/colab-link.git` (public since 2026-10-15). Releases: push a `vX.Y.Z` tag; v0.2.0 published amd64 + arm64. The Docker Hub secrets are org-level and were only usable once the repo was public. `results/`, `logs/` and generated test data are not committed (see `.gitignore`); write important numbers into this file.
 
 ## Running (CLI: `bin/colab-link`)
 ```bash
