@@ -88,7 +88,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - `colab_link/service.py`: **`colab-link serve`** (the server-side service; see the "Service mode" section). `colab_link/client.py`: submit/fetch/status for the CLI.
 - `colab_link/jobhost.py` (on the VM): keeps a job module that defines `handle(in_dir, out_dir)` loaded, so a warm worker loads the model only once.
 - `Dockerfile` / `compose.yaml`: container for the service (image `flarexio/colab-link`).
-- `.github/workflows/build.yml` (each push: compileall + an amd64/arm64 image build, not pushed); `release.yml` (pushing a `vX.Y.Z` tag builds both architectures and pushes `flarexio/colab-link:{X.Y.Z,X.Y,X,latest}` to Docker Hub; secrets `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, same as claude-runner). `README.md` is the public-facing documentation.
+- `.github/workflows/`: **no QEMU**; each architecture builds on its own native runner (`ubuntu-24.04` / `ubuntu-24.04-arm`, free for public repos). `build.yml` (each push: compileall + image build + smoke test `profiles` and `colab --help`, per arch, not pushed); `release.yml` (pushing a `vX.Y.Z` tag: each arch pushes by digest, then a merge job runs `imagetools create` and pushes `flarexio/colab-link:{X.Y.Z,X.Y,X,latest}` to Docker Hub; secrets `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, same as claude-runner). `README.md` is the public-facing documentation.
 - `colab_link/vm_env.py` (on the VM): restores or builds the venv and JIT caches, and uploads anything new after the job.
 - `colab_link/drive_vm.py` (VM or local): Drive API ls/put/get/rm.
 - `jobs/vlm_batch.py`: vLLM batch over `tasks.jsonl` (text or text + image) → `results.jsonl` + `metrics.json`.
