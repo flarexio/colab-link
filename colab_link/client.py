@@ -208,7 +208,7 @@ async def chat(model: str, messages: list[dict], start: bool = True, **params) -
                             sys.stdout.write(text)
                             sys.stdout.flush()
                     usage = chunk.get("usage") or usage
-                print()
+                print(flush=True)
                 if usage:
                     gen = time.time() - (first or t0)
                     log(f"{usage.get('prompt_tokens')} prompt + {usage.get('completion_tokens')} output tokens; "

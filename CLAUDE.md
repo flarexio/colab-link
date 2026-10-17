@@ -190,6 +190,21 @@ Must hold even if the service crashes, this machine goes down, or **Claude hits 
   - No worker ⇒ NATS 503 no-responders; clients then call `llm_start` and wait.
 - **Text only** (user decision): `--language-model-only` skips the vision encoder. Images/OCR go through batch jobs (`colab-link ocr IMAGES...` builds `tasks.jsonl` for `jobs/vlm_batch.py` and writes one `.txt` per image). NATS max_payload is 1 MB.
 - Thinking is off by default (`--default-chat-template-kwargs '{"enable_thinking": false}'`; `ENABLE_THINKING=1` in the profile env turns it on).
+- **Verified 2026-10-17 (L4, qwen35-9b-l4)**:
+
+| Test | Result |
+|---|---|
+| First cold start (builds the LLM-mode JIT cache, then uploads it) | worker start → serving 542 s |
+| **Cold start with the JIT cache** (auto-started by `chat` after an idle stop) | serving after **247 s**; `chat` → first answer 295 s |
+| `chat` stream | first token 0.2 s, ~25 tok/s for a single stream |
+| Gateway, 32 concurrent requests, max_tokens 200 | all 200, 11.1 s, **415 tok/s aggregate** |
+| Idle stop | VM stopped 5 min after the last request |
+| `colab-link ocr examples/bench/imgs` (100 receipts, batch pool, 2nd L4 at the same time) | **100/100** exact (whitespace-normalised), submit → done ~6 min, load 226 s |
+| Worker self-stop (`kill -9` the service) | VM gone ~10 min after the last ping |
+| Reaper (a VM whose worker left with no supervisor) | stopped by cron on the first pass past 15 min of grace (at 20 min) |
+
+  - Local protocol test without Colab (fake vLLM + the real relay/client/gateway): plain, stream, upstream 400, unknown route 404, no-worker 503 and 10 concurrent streams all pass.
+  - CU for the day's tests: about 0.6.
 
 ## NATS (FlareX edge convention)
 - The user's server: `wss://nats.flarex.io` (JetStream + TLS, **decentralized JWT**).
