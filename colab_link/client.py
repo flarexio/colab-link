@@ -21,7 +21,11 @@ TERMINAL = {"done", "failed", "cancelled"}
 
 
 class ServiceError(Exception):
-    """The colab-link service is not there or refused the request."""
+    """The colab-link service is not there (code 503) or refused the request."""
+
+    def __init__(self, message: str, code: int = 503):
+        super().__init__(message)
+        self.code = code
 
 
 async def _connect():
@@ -49,7 +53,9 @@ async def _request(nc, subject: str, body: dict, timeout: float = 30):
     except (NoRespondersError, TimeoutError):
         raise ServiceError(f"no colab-link service answering on {subject}; is `colab-link serve` running?")
     if msg.headers and msg.headers.get("Nats-Service-Error-Code"):
-        raise ServiceError(f"error {msg.headers['Nats-Service-Error-Code']}: {msg.headers.get('Nats-Service-Error')}")
+        code = msg.headers["Nats-Service-Error-Code"]
+        raise ServiceError(f"error {code}: {msg.headers.get('Nats-Service-Error')}",
+                           int(code) if code.isdigit() else 500)
     return json.loads(msg.data)
 
 
@@ -134,6 +140,25 @@ async def collect(cfg: config.Config, rec: dict, out: Path | None) -> int:
     log(f"job {jid} {rec['status']} (exit {rec.get('exitcode')}); output in {out}")
     log(f"timings: {json.dumps(rec.get('timings'))}")
     return rec.get("exitcode") if rec.get("exitcode") is not None else 1
+
+
+# -- OCR (a batch job for jobs/vlm_batch.py) ----------------------------------------
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+OCR_PROMPT = ("Transcribe all text in this image exactly as it appears, in reading order, "
+              "keeping line breaks. Output only the transcription.")
+
+
+def write_ocr_input(images: list[tuple[str, Path]], dst: Path, prompt: str | None, max_tokens: int) -> None:
+    """[(id, image file)] -> dst/imgs/* + dst/tasks.jsonl; results.jsonl comes back keyed by id."""
+    import shutil
+
+    (dst / "imgs").mkdir(parents=True, exist_ok=True)
+    with open(dst / "tasks.jsonl", "w") as f:
+        for i, (ident, src) in enumerate(images):
+            rel = f"imgs/{i:05d}{src.suffix.lower()}"
+            shutil.copyfile(src, dst / rel)
+            f.write(json.dumps({"id": ident, "prompt": prompt or OCR_PROMPT, "image": rel,
+                                "max_tokens": max_tokens}, ensure_ascii=False) + "\n")
 
 
 # -- LLM (OpenAI bodies over NATS; see worker.py llm_loop) ---------------------------

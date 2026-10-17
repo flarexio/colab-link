@@ -112,15 +112,18 @@ class Gateway:
                 return _error(504, f"{model} did not answer in time")
         return _error(503, f"no worker serves {model}")
 
+    def add_routes(self, app) -> None:
+        app.router.add_get("/v1/models", self.models)
+        for path in ROUTES:
+            app.router.add_post(path, self.complete)
+
 
 def main(host: str, port: int, api_key: str | None, start: bool = True, start_timeout: float = 1200) -> int:
     gw = Gateway(api_key, start, start_timeout)
     app = web.Application(middlewares=[gw.auth], client_max_size=1 << 20)
     app.on_startup.append(gw.setup)
     app.on_cleanup.append(gw.cleanup)
-    app.router.add_get("/v1/models", gw.models)
-    for path in ROUTES:
-        app.router.add_post(path, gw.complete)
+    gw.add_routes(app)
     log(f"OpenAI-compatible endpoint on http://{host}:{port}/v1 (started {time.strftime('%H:%M:%S')})")
     web.run_app(app, host=host, port=port, print=None)
     return 0

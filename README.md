@@ -68,7 +68,7 @@ there is one.
 ## Container
 
 ```bash
-docker compose up -d     # image flarexio/colab-link (linux/amd64, linux/arm64)
+docker compose up -d     # service + HTTP API + reaper; image flarexio/colab-link (amd64, arm64)
 ```
 
 See `compose.yaml`. It mounts `~/.flarex/colab-link` (read-only), mounts
@@ -103,6 +103,47 @@ How jobs are scheduled:
   - the service shuts down.
 - **Lost workers.** A job running on a lost worker is delivered again.
 
+## HTTP API
+
+`colab-link api` puts an HTTP front on the service: it takes uploads, stores them
+in Drive, queues the job, and serves the outputs back. It also answers the
+OpenAI routes under `/v1` (see below).
+
+```bash
+bin/colab-link api --port 8080 --api-key "$KEY"      # binding off loopback needs a key
+H="Authorization: Bearer $KEY"
+
+# a job: profile (or gpu + script), env KEY=VALUE, pip, idle_minutes;
+# files (repeatable; the filename may include sub/dirs) and/or archive (.tar.* or .zip)
+curl -H "$H" -F profile=qwen35-9b-l4 -F files=@tasks.jsonl -F archive=@imgs.tar.gz \
+     http://127.0.0.1:8080/api/jobs                        # -> 202 + job record with links
+curl -H "$H" -N http://127.0.0.1:8080/api/jobs/$ID/events  # SSE: status, log, progress, end
+curl -H "$H" "http://127.0.0.1:8080/api/jobs/$ID?wait=600" # or long-poll until it ends
+curl -H "$H" -o out.tar.gz http://127.0.0.1:8080/api/jobs/$ID/output
+
+# OCR: images in, one result per image out
+curl -H "$H" -F images=@scan1.png -F images=@scan2.jpg http://127.0.0.1:8080/api/ocr
+curl -H "$H" http://127.0.0.1:8080/api/jobs/$ID/results   # [{"id": "scan1.png", "output": "..."}, ...]
+```
+
+| Route | |
+|---|---|
+| `GET /api/health` | no key needed |
+| `GET /api/profiles` | profiles and whether they can be served as LLMs |
+| `POST /api/jobs` | multipart (above), or JSON `{profile, ...}` for a job with no input |
+| `GET /api/jobs` · `GET /api/jobs/{id}[?wait=s]` · `DELETE /api/jobs/{id}` | list · status · cancel |
+| `GET /api/jobs/{id}/events` | server-sent events until the job ends |
+| `GET /api/jobs/{id}/output` · `/files` · `/files/{path}` · `/results` | outputs |
+| `POST /api/ocr` | `images` (repeatable), `profile`, `prompt`, `max_tokens`, `idle_minutes` |
+| `GET /api/workers` · `GET /api/usage` | warm workers · CU balance |
+| `GET /api/llm` · `POST /api/llm/{model}/start[?wait=1]` · `POST /api/llm/{model}/stop` | model servers |
+
+Errors are JSON: `{"error": {"message", "code"}}`. The first download of a job's
+output fetches it from Drive, deletes the job's Drive files, and keeps a local
+copy for two days (`COLAB_LINK_API_DATA`). Uploads are streamed to disk, up to
+`--max-upload-mb` (2048). Put a TLS reverse proxy in front of it when it is
+reachable from outside.
+
 ## LLMs over NATS (OpenAI-compatible)
 
 A servable profile (a vLLM venv and a `MODEL` in its env) can also run as a
@@ -112,7 +153,7 @@ OpenAI requests between NATS and the model:
 ```bash
 bin/colab-link llm start qwen35-9b-l4 --wait     # cold start takes a few minutes
 bin/colab-link chat qwen35-9b-l4 "Summarise ..."  # streams; starts the model if needed
-bin/colab-link openai --port 8000                 # local OpenAI HTTP endpoint
+bin/colab-link openai --port 8000                 # local OpenAI HTTP endpoint (or use `api`)
 bin/colab-link llm ls | llm stop qwen35-9b-l4
 ```
 

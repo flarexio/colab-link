@@ -34,5 +34,6 @@ ENV PATH=/app/.venv/bin:$PATH \
     COLAB_CLI_PYTHON=/app/.venv/bin/python \
     COLAB_LINK_STATE=/data/state
 VOLUME /data
+EXPOSE 8080
 ENTRYPOINT ["colab-link"]
 CMD ["serve"]

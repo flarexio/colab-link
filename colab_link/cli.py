@@ -17,6 +17,9 @@ LLMs served on Colab, OpenAI request bodies over NATS (needs `serve`):
     colab-link chat MODEL "prompt"        (starts the model if needed)
     colab-link openai [--port 8000]       (local OpenAI-compatible HTTP endpoint)
 
+HTTP API (uploads -> Drive -> `serve`; also serves the OpenAI routes, see api.py):
+    colab-link api [--host 127.0.0.1] [--port 8080] [--api-key KEY]
+
 Idle-VM guard (see guard.py):
     colab-link reap [--dry-run] [--loop SECONDS]      (run from cron)
     colab-link lease ENDPOINT|--all [--minutes N] | lease --list | lease --drop ENDPOINT
@@ -155,17 +158,11 @@ def cmd_workers(cfg, a):
     print(f"{len(ws)} worker(s)")
 
 
-IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
-OCR_PROMPT = ("Transcribe all text in this image exactly as it appears, in reading order, "
-              "keeping line breaks. Output only the transcription.")
-
-
 def cmd_ocr(cfg, a):
     """Batch OCR: images -> tasks.jsonl for jobs/vlm_batch.py -> one .txt per image."""
     import asyncio
-    import shutil
     import tempfile
-    from .client import submit
+    from .client import IMAGE_EXT, submit, write_ocr_input
     if a.profile not in cfg.profiles:
         sys.exit(f"unknown profile {a.profile!r}; see `colab-link profiles`")
     images: list[tuple[str, Path]] = []
@@ -181,13 +178,7 @@ def cmd_ocr(cfg, a):
     prompt = Path(a.prompt_file).read_text() if a.prompt_file else a.prompt
     out = a.out or config.ROOT / "results" / f"ocr-{time.strftime('%Y%m%d-%H%M%S')}"
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "imgs").mkdir()
-        with open(Path(tmp) / "tasks.jsonl", "w") as f:
-            for i, (ident, src) in enumerate(images):
-                dst = f"imgs/{i:05d}{src.suffix.lower()}"
-                shutil.copyfile(src, Path(tmp) / dst)
-                f.write(json.dumps({"id": ident, "prompt": prompt, "image": dst,
-                                    "max_tokens": a.max_tokens}, ensure_ascii=False) + "\n")
+        write_ocr_input(images, Path(tmp), prompt, a.max_tokens)
         print(f"{len(images)} image(s) -> {a.profile}", file=sys.stderr)
         req = {"profile": a.profile, "idle_minutes": a.idle_minutes}
         code = asyncio.run(submit(cfg, req, Path(tmp), out, not a.no_wait))
@@ -241,6 +232,12 @@ def cmd_chat(cfg, a):
 def cmd_openai(cfg, a):
     from .openai_gateway import main as gateway
     return gateway(a.host, a.port, a.api_key or os.environ.get("COLAB_LINK_API_KEY"), start=not a.no_start)
+
+
+def cmd_api(cfg, a):
+    from .api import main as api
+    return api(cfg, a.host, a.port, a.api_key or os.environ.get("COLAB_LINK_API_KEY"),
+               start=not a.no_start, max_upload_mb=a.max_upload_mb)
 
 
 def cmd_reap(cfg, a):
@@ -351,7 +348,7 @@ def main(argv=None) -> None:
     oc = sub.add_parser("ocr", help="batch OCR: images or directories of images -> text, on `serve`")
     oc.add_argument("inputs", nargs="+", type=Path)
     oc.add_argument("--profile", default="qwen35-9b-l4")
-    oc.add_argument("--prompt", default=OCR_PROMPT)
+    oc.add_argument("--prompt", help="instruction sent with each image (default: plain transcription)")
     oc.add_argument("--prompt-file", help="read the prompt from a file")
     oc.add_argument("--max-tokens", type=int, default=4096)
     oc.add_argument("--out", type=Path, help="output dir (default results/ocr-<time>)")
@@ -375,6 +372,14 @@ def main(argv=None) -> None:
     oa.add_argument("--port", type=int, default=8000)
     oa.add_argument("--api-key", help="require this bearer key (or env COLAB_LINK_API_KEY)")
     oa.add_argument("--no-start", action="store_true", help="answer 503 instead of starting a model")
+
+    hp = sub.add_parser("api", help="HTTP API: upload files, run jobs, download results; OpenAI at /v1")
+    hp.add_argument("--host", default="127.0.0.1")
+    hp.add_argument("--port", type=int, default=8080)
+    hp.add_argument("--api-key", help="require this bearer key (or env COLAB_LINK_API_KEY); "
+                                      "needed off loopback")
+    hp.add_argument("--max-upload-mb", type=int, default=2048)
+    hp.add_argument("--no-start", action="store_true", help="/v1: answer 503 instead of starting a model")
 
     rp = sub.add_parser("reap", help="stop Colab sessions nobody supervises or leases (run from cron)")
     rp.add_argument("--dry-run", action="store_true")
@@ -403,7 +408,7 @@ def main(argv=None) -> None:
                "sessions": cmd_sessions, "stop-all": cmd_stop_all, "usage": cmd_usage,
                "serve": cmd_serve, "submit": cmd_submit, "jobs": cmd_jobs, "cancel": cmd_cancel, "fetch": cmd_fetch,
                "workers": cmd_workers, "ocr": cmd_ocr, "llm": cmd_llm, "chat": cmd_chat,
-               "openai": cmd_openai, "reap": cmd_reap, "lease": cmd_lease}[a.cmd]
+               "openai": cmd_openai, "api": cmd_api, "reap": cmd_reap, "lease": cmd_lease}[a.cmd]
     from .client import ServiceError
     try:
         sys.exit(handler(cfg, a) or 0)

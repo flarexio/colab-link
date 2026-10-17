@@ -1,7 +1,7 @@
 # colab-link
 
 Goal: run Python jobs on rented Colab GPUs on demand: start a session → set up the environment (cached) → run → return results → stop the VM. The main uses are LLM processing and OCR with a multimodal LLM, but **it is not limited to batch jobs**; any Python job script works.
-Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (done) → ③.5 NATS edge worker + **service mode/warm workers/container (current)** → ④ HTTP API (upload to Drive + call `run`).
+Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (done) → ③.5 NATS edge worker + service mode/warm workers/container (done) → ④ HTTP API (done, `colab-link api`) → deploy.
 
 **Keep this file updated**: whenever you verify a new fact, hit a pitfall, or make a design decision, write it here so the next session can pick it up.
 **This repo is public**: put no credentials, account emails, GCP project ids, Drive folder ids or edge ids here. Those, along with the user's working rules and local environment notes, go in `CLAUDE.local.md` (gitignored, loaded automatically).
@@ -86,7 +86,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - `colab_link/worker.py` (on the VM, edge worker): see its docstring for the subject list. One job at a time; `.ctl` accepts `drive_token` (the token is refreshed every 40 min over NATS) and `shutdown`.
 - `colab_link/runner.py`: the old exec-polling transport (`run --transport exec`), kept as a fallback.
 - `colab_link/service.py`: **`colab-link serve`** (the server-side service; see the "Service mode" section). `colab_link/client.py`: submit/fetch/status for the CLI.
-- `colab_link/guard.py`: reaper + leases (see "Idle-VM guard"). `colab_link/colab_api.py` (stdlib, local and on the VM): list/unassign sessions through the Colab API. `colab_link/openai_gateway.py`: local OpenAI HTTP endpoint → NATS LLM workers.
+- `colab_link/guard.py`: reaper + leases (see "Idle-VM guard"). `colab_link/colab_api.py` (stdlib, local and on the VM): list/unassign sessions through the Colab API. `colab_link/openai_gateway.py`: local OpenAI HTTP endpoint → NATS LLM workers. `colab_link/api.py`: **HTTP API** (see "HTTP API").
 - `colab_link/jobhost.py` (on the VM): keeps a job module that defines `handle(in_dir, out_dir)` loaded, so a warm worker loads the model only once.
 - `Dockerfile` / `compose.yaml`: container for the service (image `flarexio/colab-link`).
 - `.github/workflows/`: **no QEMU**; each architecture builds on its own native runner (`ubuntu-24.04` / `ubuntu-24.04-arm`, free for public repos). `build.yml` (each push: compileall + image build + smoke test `profiles` and `colab --help`, per arch, not pushed); `release.yml` (pushing a `vX.Y.Z` tag: each arch pushes by digest, then a merge job runs `imagetools create` and pushes `flarexio/colab-link:{X.Y.Z,X.Y,X,latest}` to Docker Hub; secrets `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, same as claude-runner). `README.md` is the public-facing documentation.
@@ -205,6 +205,16 @@ Must hold even if the service crashes, this machine goes down, or **Claude hits 
 
   - Local protocol test without Colab (fake vLLM + the real relay/client/gateway): plain, stream, upstream 400, unknown route 404, no-worker 503 and 10 concurrent streams all pass.
   - CU for the day's tests: about 0.6.
+
+## HTTP API (`colab-link api`, 2026-10-17)
+- aiohttp, one process: `/api/*` (jobs, OCR, outputs, workers, usage, LLM start/stop) + the OpenAI `/v1/*` routes (same `Gateway` class, sharing one NATS connection). Route list in `api.py`'s docstring and README.
+- It is a client of `serve` (NATS `run`/`status`/`cancel`/...), not part of it, so it can run anywhere with the creds + the colab CLI token (for Drive). compose has an `api` service (port 8080, `COLAB_LINK_API_KEY` required).
+- Upload: multipart streamed to disk (`--max-upload-mb`, default 2048; `client_max_size` 1 MB only bounds JSON bodies) → `in/` (fields `files` with safe relative names, `archive` .tar.*/.zip extracted with the data filter) → tar.gz → Drive → `run`. A failed `run` removes the Drive file.
+- Output: the first download fetches out.tar.gz from Drive, extracts it under `COLAB_LINK_API_DATA` (default `~/.cache/colab-link/api`), **deletes the job's Drive files**, keeps the local copy 2 days. `files/{path}` is resolved and checked to stay inside `out/`.
+- Drive token refreshed every 40 min (`DRIVE_TOKEN` env, which `drive_vm` re-reads per call). `ServiceError` now has `.code` (from `Nats-Service-Error-Code`), mapped to the HTTP status.
+- Security: refuses a non-loopback `--host` without an API key; all routes but `/api/health` need `Authorization: Bearer`. No TLS of its own: put it behind a reverse proxy.
+- **Verified (2026-10-17)**: hello-cpu via multipart (files with sub/dirs + a tar archive) → SSE showed queued → running → log/progress → done → end; output/files/summary downloaded; a warm 2nd job (JSON body, no input) done in **15 s** with `?wait`; Drive job files gone after collection; 401 / 400 (unknown profile, non-image, `../x` filename) / 404 (unknown job, `../` file path) all correct.
+  - `POST /api/ocr` with 8 bench receipts (L4, cold VM, caches hit): **8/8** exact, total 300 s (env 66 s, job 228 s); `/results` returned them keyed by filename.
 
 ## NATS (FlareX edge convention)
 - The user's server: `wss://nats.flarex.io` (JetStream + TLS, **decentralized JWT**).
