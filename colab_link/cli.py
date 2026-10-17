@@ -10,6 +10,16 @@ Service mode (warm workers fed from a JetStream queue):
     colab-link serve
     colab-link submit qwen35-9b-l4 --input DIR [--wait] [--out DIR]
     colab-link jobs [JOB_ID] | fetch JOB_ID | cancel JOB_ID | workers
+    colab-link ocr IMAGES_OR_DIRS... [--profile P] [--out DIR]     (batch OCR job)
+
+LLMs served on Colab, OpenAI request bodies over NATS (needs `serve`):
+    colab-link llm ls | llm start MODEL [--wait] | llm stop MODEL
+    colab-link chat MODEL "prompt"        (starts the model if needed)
+    colab-link openai [--port 8000]       (local OpenAI-compatible HTTP endpoint)
+
+Idle-VM guard (see guard.py):
+    colab-link reap [--dry-run] [--loop SECONDS]      (run from cron)
+    colab-link lease ENDPOINT|--all [--minutes N] | lease --list | lease --drop ENDPOINT
 """
 from __future__ import annotations
 
@@ -145,6 +155,116 @@ def cmd_workers(cfg, a):
     print(f"{len(ws)} worker(s)")
 
 
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+OCR_PROMPT = ("Transcribe all text in this image exactly as it appears, in reading order, "
+              "keeping line breaks. Output only the transcription.")
+
+
+def cmd_ocr(cfg, a):
+    """Batch OCR: images -> tasks.jsonl for jobs/vlm_batch.py -> one .txt per image."""
+    import asyncio
+    import shutil
+    import tempfile
+    from .client import submit
+    if a.profile not in cfg.profiles:
+        sys.exit(f"unknown profile {a.profile!r}; see `colab-link profiles`")
+    images: list[tuple[str, Path]] = []
+    for p in a.inputs:
+        if p.is_dir():
+            images += [(str(f.relative_to(p)), f) for f in sorted(p.rglob("*")) if f.suffix.lower() in IMAGE_EXT]
+        elif p.suffix.lower() in IMAGE_EXT:
+            images.append((p.name, p))
+        else:
+            sys.exit(f"not an image or directory: {p}")
+    if not images:
+        sys.exit("no images found")
+    prompt = Path(a.prompt_file).read_text() if a.prompt_file else a.prompt
+    out = a.out or config.ROOT / "results" / f"ocr-{time.strftime('%Y%m%d-%H%M%S')}"
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "imgs").mkdir()
+        with open(Path(tmp) / "tasks.jsonl", "w") as f:
+            for i, (ident, src) in enumerate(images):
+                dst = f"imgs/{i:05d}{src.suffix.lower()}"
+                shutil.copyfile(src, Path(tmp) / dst)
+                f.write(json.dumps({"id": ident, "prompt": prompt, "image": dst,
+                                    "max_tokens": a.max_tokens}, ensure_ascii=False) + "\n")
+        print(f"{len(images)} image(s) -> {a.profile}", file=sys.stderr)
+        req = {"profile": a.profile, "idle_minutes": a.idle_minutes}
+        code = asyncio.run(submit(cfg, req, Path(tmp), out, not a.no_wait))
+    if a.no_wait or not (out / "results.jsonl").exists():
+        return code
+    text_dir = out / "text"
+    for line in (out / "results.jsonl").read_text().splitlines():
+        r = json.loads(line)
+        dst = text_dir / (r["id"] + ".txt")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(r["output"])
+    print(f"text in {text_dir}", file=sys.stderr)
+    return code
+
+
+def cmd_llm(cfg, a):
+    import asyncio
+    from .client import _connect, _request, ensure_llm
+
+    async def go():
+        nc, topic = await _connect()
+        try:
+            if a.action == "ls":
+                return await _request(nc, f"{topic}.llm_list", {})
+            if not a.model:
+                sys.exit(f"llm {a.action} needs a MODEL")
+            if a.action == "stop":
+                return [await _request(nc, f"{topic}.llm_stop", {"model": a.model})]
+            if a.wait:
+                return [await ensure_llm(nc, topic, a.model, idle_minutes=a.idle_minutes)]
+            return [await _request(nc, f"{topic}.llm_start", {"model": a.model, "idle_minutes": a.idle_minutes})]
+        finally:
+            await nc.drain()
+
+    for v in asyncio.run(go()):
+        ws = ", ".join(f"{w['vm']} {w['state']} inflight={w['inflight']} requests={w['requests']} up={w['up_s']}s"
+                       for w in v["workers"]) or ("starting" if v["wanted"] else "-")
+        print(f"{v['model']:<18} {v['gpu'] or 'CPU':<4} {v['hf_model']:<28} {ws}")
+
+
+def cmd_chat(cfg, a):
+    import asyncio
+    from .client import chat
+    prompt = a.prompt if a.prompt is not None else sys.stdin.read()
+    messages = ([{"role": "system", "content": a.system}] if a.system else []) + \
+        [{"role": "user", "content": prompt}]
+    params = {k: v for k, v in {"max_tokens": a.max_tokens, "temperature": a.temperature}.items() if v is not None}
+    return asyncio.run(chat(a.model, messages, start=not a.no_start, **params))
+
+
+def cmd_openai(cfg, a):
+    from .openai_gateway import main as gateway
+    return gateway(a.host, a.port, a.api_key or os.environ.get("COLAB_LINK_API_KEY"), start=not a.no_start)
+
+
+def cmd_reap(cfg, a):
+    from .guard import main as reap
+    return reap(a.dry_run, a.loop)
+
+
+def cmd_lease(cfg, a):
+    from . import colab_api, guard
+    if a.list or (not a.endpoint and not a.all and not a.drop):
+        held = guard.leases()
+        for ep, rec in held.items():
+            print(f"{ep}  until {time.strftime('%m-%d %H:%M', time.localtime(rec['until']))}  {rec.get('reason', '')}")
+        print(f"{len(held)} lease(s)")
+        return
+    if a.drop:
+        guard.drop_lease(a.drop)
+        return
+    eps = [x["endpoint"] for x in colab_api.assignments(drive_token())] if a.all else [a.endpoint]
+    for ep in eps:
+        rec = guard.lease(ep, a.minutes * 60, a.reason)
+        print(f"leased {ep} until {time.strftime('%H:%M', time.localtime(rec['until']))}")
+
+
 def cmd_cache(cfg, a):
     d = _drive(cfg)
     if a.action == "ls":
@@ -228,6 +348,44 @@ def main(argv=None) -> None:
     cn = sub.add_parser("cancel", help="cancel a queued or running job")
     cn.add_argument("job_id")
     sub.add_parser("workers", help="warm workers of the service")
+    oc = sub.add_parser("ocr", help="batch OCR: images or directories of images -> text, on `serve`")
+    oc.add_argument("inputs", nargs="+", type=Path)
+    oc.add_argument("--profile", default="qwen35-9b-l4")
+    oc.add_argument("--prompt", default=OCR_PROMPT)
+    oc.add_argument("--prompt-file", help="read the prompt from a file")
+    oc.add_argument("--max-tokens", type=int, default=4096)
+    oc.add_argument("--out", type=Path, help="output dir (default results/ocr-<time>)")
+    oc.add_argument("--idle-minutes", type=float)
+    oc.add_argument("--no-wait", action="store_true", help="queue only; collect later with `fetch`")
+
+    ll = sub.add_parser("llm", help="LLMs served on Colab: ls | start MODEL | stop MODEL")
+    ll.add_argument("action", choices=["ls", "start", "stop"])
+    ll.add_argument("model", nargs="?", help="a servable profile name")
+    ll.add_argument("--idle-minutes", type=float, help="stop after this long without requests")
+    ll.add_argument("--wait", action="store_true", help="start: wait until it serves")
+    ch = sub.add_parser("chat", help="one chat completion from a Colab LLM, streamed")
+    ch.add_argument("model")
+    ch.add_argument("prompt", nargs="?", help="default: read stdin")
+    ch.add_argument("--system")
+    ch.add_argument("--max-tokens", type=int)
+    ch.add_argument("--temperature", type=float)
+    ch.add_argument("--no-start", action="store_true", help="fail instead of starting the model")
+    oa = sub.add_parser("openai", help="local OpenAI-compatible HTTP endpoint for the Colab LLMs")
+    oa.add_argument("--host", default="127.0.0.1")
+    oa.add_argument("--port", type=int, default=8000)
+    oa.add_argument("--api-key", help="require this bearer key (or env COLAB_LINK_API_KEY)")
+    oa.add_argument("--no-start", action="store_true", help="answer 503 instead of starting a model")
+
+    rp = sub.add_parser("reap", help="stop Colab sessions nobody supervises or leases (run from cron)")
+    rp.add_argument("--dry-run", action="store_true")
+    rp.add_argument("--loop", type=float, help="repeat every N seconds instead of one pass")
+    ls_ = sub.add_parser("lease", help="keep a session safe from the reaper (manual or browser use)")
+    ls_.add_argument("endpoint", nargs="?", help="session endpoint (see `colab-link sessions`)")
+    ls_.add_argument("--all", action="store_true", help="lease every live session")
+    ls_.add_argument("--minutes", type=float, default=120)
+    ls_.add_argument("--reason", default="manual")
+    ls_.add_argument("--list", action="store_true")
+    ls_.add_argument("--drop", metavar="ENDPOINT")
 
     c = sub.add_parser("cache", help="Drive cache files")
     csub = c.add_subparsers(dest="action", required=True)
@@ -244,5 +402,10 @@ def main(argv=None) -> None:
     handler = {"profiles": cmd_profiles, "run": cmd_run, "cache": cmd_cache,
                "sessions": cmd_sessions, "stop-all": cmd_stop_all, "usage": cmd_usage,
                "serve": cmd_serve, "submit": cmd_submit, "jobs": cmd_jobs, "cancel": cmd_cancel, "fetch": cmd_fetch,
-               "workers": cmd_workers}[a.cmd]
-    sys.exit(handler(cfg, a) or 0)
+               "workers": cmd_workers, "ocr": cmd_ocr, "llm": cmd_llm, "chat": cmd_chat,
+               "openai": cmd_openai, "reap": cmd_reap, "lease": cmd_lease}[a.cmd]
+    from .client import ServiceError
+    try:
+        sys.exit(handler(cfg, a) or 0)
+    except ServiceError as e:
+        sys.exit(str(e))

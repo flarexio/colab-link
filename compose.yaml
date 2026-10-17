@@ -12,5 +12,19 @@ services:
       - colab-link-state:/data                             # per-VM CLI state, to stop VMs after a restart
     stop_grace_period: 2m   # SIGTERM stops every warm VM before exit
 
+  # Stops any Colab session on the account that nobody supervises or leases
+  # (see colab_link/guard.py). Separate from the service so it keeps working
+  # when the service is down. Run it on one machine only.
+  reaper:
+    image: flarexio/colab-link
+    restart: unless-stopped
+    command: ["reap", "--loop", "300"]
+    environment:
+      COLAB_LINK_GUARD: /data/guard
+    volumes:
+      - ~/.flarex/colab-link:/root/.flarex/colab-link:ro
+      - ~/.config/colab-cli:/root/.config/colab-cli
+      - colab-link-state:/data
+
 volumes:
   colab-link-state:

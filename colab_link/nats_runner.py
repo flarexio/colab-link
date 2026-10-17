@@ -53,11 +53,12 @@ def launch_agent(sess: ColabSession, vm: str, gpu: str | None, drive_project: st
         for local, remote in [(flarex / "user.creds", ".nats.creds"), (flarex / "id", "id"),
                               (tok, ".drive_token"), (here / "worker.py", "worker.py"),
                               (here / "jobhost.py", "jobhost.py"), (here / "drive_vm.py", "drive_vm.py"),
-                              (here / "vm_env.py", "vm_env.py")]:
+                              (here / "vm_env.py", "vm_env.py"), (here / "colab_api.py", "colab_api.py")]:
             sess.upload(local, f"{AGENT}/{remote}")
     agent_env = {"VM_ID": vm, "NATS_URL": NATS_URL, "GPU": gpu or "",
                  "DRIVE_QUOTA_PROJECT": drive_project, "DRIVE_ROOT": cache_root,
                  "DRIVE_JOBS_ROOT": jobs_root, "DRIVE_TOKEN_FILE": f"{AGENT}/.drive_token",
+                 "COLAB_ENDPOINT": sess.endpoint or "",
                  **(extra_env or {})}
     sess.exec(LAUNCH.format(agent=AGENT, env=agent_env), 120)
 
@@ -152,7 +153,7 @@ async def run_job_nats(job: Path, input_dir: Path, out_dir: Path, gpu: str | Non
             log(f"job {job_id} accepted")
 
             deadline = time.time() + max_hours * 3600
-            token_t = time.time()
+            token_t = ping_t = time.time()
             while not done.is_set():
                 try:
                     await asyncio.wait_for(done.wait(), 10)
@@ -163,6 +164,9 @@ async def run_job_nats(job: Path, input_dir: Path, out_dir: Path, gpu: str | Non
                     raise RuntimeError(f"no heartbeat for {now - last_beat[0]:.0f}s; VM presumed dead")
                 if now > deadline:
                     raise RuntimeError(f"max_hours ({max_hours}) reached")
+                if now - ping_t > 30:  # the worker stops its own VM when we go quiet
+                    await nc.publish(f"{base}.ctl", json.dumps({"op": "ping"}).encode())
+                    ping_t = now
                 if now - token_t > 40 * 60:  # Drive tokens last ~1 h
                     await nc.publish(f"{base}.ctl", json.dumps(
                         {"op": "drive_token", "token": await asyncio.to_thread(drive_token)}).encode())

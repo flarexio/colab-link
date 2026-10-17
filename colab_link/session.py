@@ -99,6 +99,14 @@ class ColabSession:
             self.cli("stop", "-s", self.name, check=False, timeout=120)
             self.started = False
 
+    @property
+    def endpoint(self) -> str | None:
+        """Colab's id for this VM (what the session API and the reaper use)."""
+        try:
+            return json.loads(self.state_file.read_text() or "{}").get(self.name, {}).get("endpoint")
+        except (OSError, ValueError):
+            return None
+
     def forget(self) -> None:
         """Delete the per-session state file once the CLI has emptied it."""
         try:

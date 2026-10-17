@@ -9,6 +9,14 @@ Endpoints (micro service "colab-link", group edges.<edge>.colab-link, JSON in/ou
   status   {job_id} -> job record   |   {} -> recent job records
   cancel   {job_id} -> job record
   workers  {} -> live workers
+  llm_start {model, idle_minutes?} -> model view   (model = a servable profile name)
+  llm_stop  {model} -> model view
+  llm_list  {} -> [model view]   {model, gpu, wanted, workers: [{vm, state, inflight, ...}]}
+
+LLM pools (mode "llm") have no queue: while a model is wanted the service keeps
+one worker running `vllm serve`; callers talk to it directly over NATS with
+OpenAI request bodies on edges.<edge>.colab-link.llm.<model>.<route> (see
+worker.py). The worker leaves after idle_minutes without requests.
 
 A pool is everything that must match for a worker to take a job: GPU, script,
 env, venv, pip. Each pool has a durable pull consumer on the work queue; this
@@ -65,11 +73,12 @@ class Worker:
     started_at: float = field(default_factory=time.time)
     last_beat: float = 0.0
     job_id: str | None = None
+    llm: dict | None = None    # LLM workers: {model, state, inflight, requests, load_s?}
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     def view(self) -> dict:
         return {"vm": self.vm, "pool": self.pool, "gpu": self.gpu, "state": self.state,
-                "job_id": self.job_id, "up_s": round(time.time() - self.started_at),
+                "job_id": self.job_id, "llm": self.llm, "up_s": round(time.time() - self.started_at),
                 "last_beat_s": round(time.time() - self.last_beat, 1) if self.last_beat else None}
 
 
@@ -84,6 +93,7 @@ class Service:
         self.workers: dict[str, Worker] = {}
         self.pools: dict[str, dict] = {}
         self.backoff: dict[str, float] = {}
+        self.wanted: set[str] = set()   # LLM pools that should have a worker
         self.wake = asyncio.Event()
         self.stopping = asyncio.Event()
         self.token = ""
@@ -128,13 +138,15 @@ class Service:
                                 description="Run Python jobs on rented Colab GPUs")
         group = svc.add_group(name=self.topic)
         for name, handler in [("run", self.ep_run), ("status", self.ep_status),
-                              ("cancel", self.ep_cancel), ("workers", self.ep_workers)]:
+                              ("cancel", self.ep_cancel), ("workers", self.ep_workers),
+                              ("llm_start", self.ep_llm_start), ("llm_stop", self.ep_llm_stop),
+                              ("llm_list", self.ep_llm_list)]:
             await group.add_endpoint(name=name, handler=handler)
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stopping.set)
-        log(f"serving on {self.topic}.{{run,status,cancel,workers}} ({len(self.pools)} known pools)")
+        log(f"serving on {self.topic}.{{run,status,cancel,workers,llm_*}} ({len(self.pools)} known pools)")
         tasks = [asyncio.create_task(t) for t in (self.scale_loop(), self.monitor_loop(),
                                                     self.cleanup_loop(), self.reap_orphans())]
         await self.stopping.wait()
@@ -183,12 +195,28 @@ class Service:
         spec["max_workers"] = int(prof.max_workers if prof else 1)
         return spec
 
+    def llm_pool_for(self, model: str, idle_minutes: float | None = None) -> dict:
+        prof = self.cfg.profiles.get(model)
+        if not prof or not prof.servable:
+            names = ", ".join(n for n, p in self.cfg.profiles.items() if p.servable)
+            raise ValueError(f"unknown model {model!r}; servable profiles: {names}")
+        env = dict(prof.env)
+        spec = {"mode": "llm", "profile": model, "gpu": prof.gpu, "env": env, "pip": [], "cache": True,
+                "venv": {"name": prof.venv, "packages": prof.packages,
+                         # `vllm serve` compiles other graphs than the batch job: its own JIT cache.
+                         "jit": prof.jit_id({**env, "_gpu": prof.gpu or "CPU", "_mode": "llm"})}}
+        digest = hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:8]
+        spec["pool_id"] = f"llm-{model}-{digest}"
+        spec["idle_minutes"] = float(idle_minutes or prof.idle_minutes)
+        spec["max_workers"] = 1
+        return spec
+
     async def ensure_pool(self, spec: dict) -> None:
         from nats.js import api
 
         pid = spec["pool_id"]
         await self.kv.put(f"pools.{pid}", json.dumps(spec).encode())
-        if pid not in self.pools:
+        if pid not in self.pools and spec.get("mode") != "llm":
             try:
                 await self.js.consumer_info(self.stream, f"pool-{pid}")
             except Exception:
@@ -257,6 +285,49 @@ class Service:
     async def ep_workers(self, req) -> None:
         await req.respond(json.dumps([w.view() for w in self.workers.values()]).encode())
 
+    def llm_view(self, model: str) -> dict:
+        prof = self.cfg.profiles[model]
+        ws = [w for w in self.workers.values() if self.pools.get(w.pool, {}).get("profile") == model
+              and self.pools[w.pool].get("mode") == "llm"]
+        return {"model": model, "gpu": prof.gpu, "hf_model": prof.env.get("MODEL"),
+                "wanted": any(self.pools[p]["profile"] == model for p in self.wanted),
+                "workers": [{"vm": w.vm, "state": (w.llm or {}).get("state") or w.state,
+                             "inflight": (w.llm or {}).get("inflight", 0),
+                             "requests": (w.llm or {}).get("requests", 0),
+                             "load_s": (w.llm or {}).get("load_s"), "up_s": round(time.time() - w.started_at)}
+                            for w in ws]}
+
+    async def ep_llm_start(self, req) -> None:
+        try:
+            body = json.loads(req.data or b"{}")
+            spec = self.llm_pool_for(body.get("model", ""), body.get("idle_minutes"))
+        except Exception as e:
+            await req.respond_error("400", str(e))
+            return
+        await self.ensure_pool(spec)
+        if spec["pool_id"] not in self.wanted:
+            log(f"LLM {spec['profile']} wanted (pool {spec['pool_id']})")
+        self.wanted.add(spec["pool_id"])
+        self.backoff.pop(spec["pool_id"], None)
+        self.wake.set()
+        await req.respond(json.dumps(self.llm_view(spec["profile"])).encode())
+
+    async def ep_llm_stop(self, req) -> None:
+        model = json.loads(req.data or b"{}").get("model", "")
+        if model not in self.cfg.profiles:
+            await req.respond_error("404", f"unknown model {model!r}")
+            return
+        for pid in [p for p in self.wanted if self.pools[p]["profile"] == model]:
+            self.wanted.discard(pid)
+        for w in list(self.workers.values()):
+            if self.pools.get(w.pool, {}).get("mode") == "llm" and self.pools[w.pool]["profile"] == model:
+                asyncio.create_task(self.stop_worker(w, "llm_stop"))
+        await req.respond(json.dumps(self.llm_view(model)).encode())
+
+    async def ep_llm_list(self, req) -> None:
+        await req.respond(json.dumps([self.llm_view(n) for n, p in self.cfg.profiles.items()
+                                      if p.servable]).encode())
+
     # -- worker events -----------------------------------------------------------
     @staticmethod
     def vm_of(msg) -> str:
@@ -283,16 +354,20 @@ class Service:
             sess.started = True
             w = self.workers[vm] = Worker(vm, data["pool"], data.get("gpu") or None, sess)
             w.ready.set()
+            if data.get("llm"):
+                self.wanted.add(w.pool)
             log(f"adopted running worker {vm} (pool {w.pool})")
         if w.state == "stopping":
             return
         w.last_beat = time.time()
         w.state = "busy" if data.get("busy") else "idle"
         w.job_id = data.get("job_id")
+        w.llm = data.get("llm")
 
     async def on_bye(self, msg) -> None:
         w = self.workers.get(self.vm_of(msg))
         if w and w.state != "stopping":
+            self.wanted.discard(w.pool)  # an LLM worker leaves when nobody used it
             asyncio.create_task(self.stop_worker(w, "idle"))
 
     # -- scaling -----------------------------------------------------------------
@@ -308,20 +383,25 @@ class Service:
                 pass
             self.wake.clear()
             for pid, spec in list(self.pools.items()):
-                try:
-                    pending = (await self.js.consumer_info(self.stream, f"pool-{pid}")).num_pending
-                except Exception:
-                    continue
                 ws = [w for w in self.workers.values() if w.pool == pid and w.state != "stopping"]
-                free = [w for w in ws if w.state in ("starting", "idle")]
-                if pending <= len(free) or len(ws) >= spec["max_workers"]:
-                    continue
+                if spec.get("mode") == "llm":
+                    if pid not in self.wanted or ws:
+                        continue
+                else:
+                    try:
+                        pending = (await self.js.consumer_info(self.stream, f"pool-{pid}")).num_pending
+                    except Exception:
+                        continue
+                    free = [w for w in ws if w.state in ("starting", "idle")]
+                    if pending <= len(free) or len(ws) >= spec["max_workers"]:
+                        continue
                 if time.time() < self.backoff.get(pid, 0):
                     continue
                 if not self.capacity(spec["gpu"]):
                     # Free a slot held by an idle worker of another pool on the same GPU type.
+                    # LLM workers are never evicted: someone is talking to them.
                     idle = [w for w in self.workers.values()
-                            if w.state == "idle" and w.pool != pid and w.gpu == spec["gpu"]]
+                            if w.state == "idle" and w.pool != pid and w.gpu == spec["gpu"] and not w.llm]
                     if idle:
                         log(f"pool {pid} waiting: asking idle {idle[0].vm} ({idle[0].pool}) to leave")
                         await self.nc.publish(f"{self.topic}.workers.{idle[0].vm}.ctl",
@@ -374,9 +454,15 @@ class Service:
 
     # -- housekeeping --------------------------------------------------------------
     async def monitor_loop(self) -> None:
+        ping_t = 0.0
         while True:
             await asyncio.sleep(10)
             t = time.time()
+            if t - ping_t > 30:  # workers release their own VM when we go quiet (worker.py self-stop)
+                ping_t = t
+                for w in list(self.workers.values()):
+                    if w.state != "stopping":
+                        await self.nc.publish(f"{self.topic}.workers.{w.vm}.ctl", b'{"op": "ping"}')
             for w in list(self.workers.values()):
                 if w.state in ("idle", "busy") and t - w.last_beat > HEARTBEAT_TIMEOUT_S:
                     asyncio.create_task(self.stop_worker(w, f"no heartbeat for {t - w.last_beat:.0f}s"))

@@ -22,6 +22,11 @@ class Profile:
     idle_minutes: float = 10   # serve: a warm worker leaves after this long without jobs
     max_workers: int = 1       # serve: VMs per pool (Colab allows 2 per GPU type)
 
+    @property
+    def servable(self) -> bool:
+        """`colab-link llm` can serve it: a vLLM venv and a MODEL to load."""
+        return any(p.startswith("vllm") for p in self.packages) and "MODEL" in self.env
+
     def jit_id(self, env: dict[str, str]) -> str:
         """Compiled kernels depend on model, quantization, limits and GPU."""
         key = json.dumps({"gpu": self.gpu, "env": dict(sorted(env.items()))})
@@ -51,5 +56,6 @@ def load(path: str | None = None) -> Config:
                                  idle_minutes=float(p.get("idle_minutes", 10)),
                                  max_workers=int(p.get("max_workers", 1)))
     drive = raw.get("drive", {})
-    return Config(drive_project=os.environ.get("COLAB_LINK_DRIVE_PROJECT") or drive.get("project") or None, drive_root=drive.get("root", "colab-link-cache"),
+    return Config(drive_project=os.environ.get("COLAB_LINK_DRIVE_PROJECT") or drive.get("project") or None,
+                  drive_root=drive.get("root", "colab-link-cache"),
                   drive_jobs_root=drive.get("jobs_root", "colab-link-jobs"), profiles=profiles)

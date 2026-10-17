@@ -24,9 +24,11 @@ import time
 import uuid
 from pathlib import Path
 
+from . import guard
 from .session import ColabSession, drive_token
 
 REMOTE = "/content/run"
+LEASE_S = 20 * 60  # renewed every poll; see guard.py
 
 # Guarded by a marker file so a retried exec never starts the job twice.
 LAUNCH = r"""
@@ -82,6 +84,9 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
         try:
             log(f"starting {name} gpu={gpu or 'CPU'}")
             sess.start()
+            # This transport has no worker heartbeat: a short lease renewed while we
+            # poll keeps the reaper away, and lapses soon after this process dies.
+            guard.lease(sess.endpoint or name, LEASE_S, f"colab-link run --transport exec ({name})")
             sess.wait_ready()
             timings["provision_s"] = time.time() - t0
 
@@ -129,6 +134,7 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
             poll_failures = 0
             while time.time() < deadline:
                 time.sleep(poll_s)
+                guard.lease(sess.endpoint or name, LEASE_S, f"colab-link run --transport exec ({name})")
                 if drive_project and time.time() - token_t > 40 * 60:  # tokens last ~1 h
                     try:
                         push_token()
@@ -171,8 +177,11 @@ def run_job(job: Path, input_dir: Path, out_dir: Path, gpu: str | None,
                 tf.extractall(out_dir, filter="data")
         finally:
             log(f"stopping {name}")
+            ep = sess.endpoint
             sess.stop()
             sess.forget()
+            if ep:
+                guard.drop_lease(ep)
 
     timings["total_s"] = time.time() - t0
     exitcode = status.get("exitcode")

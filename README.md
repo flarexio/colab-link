@@ -103,6 +103,66 @@ How jobs are scheduled:
   - the service shuts down.
 - **Lost workers.** A job running on a lost worker is delivered again.
 
+## LLMs over NATS (OpenAI-compatible)
+
+A servable profile (a vLLM venv and a `MODEL` in its env) can also run as a
+long-lived model server. The worker runs `vllm serve` on the VM and relays
+OpenAI requests between NATS and the model:
+
+```bash
+bin/colab-link llm start qwen35-9b-l4 --wait     # cold start takes a few minutes
+bin/colab-link chat qwen35-9b-l4 "Summarise ..."  # streams; starts the model if needed
+bin/colab-link openai --port 8000                 # local OpenAI HTTP endpoint
+bin/colab-link llm ls | llm stop qwen35-9b-l4
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+client.chat.completions.create(model="qwen35-9b-l4", messages=[{"role": "user", "content": "hi"}])
+```
+
+Wire protocol, for clients that speak NATS directly:
+
+- **Subject.** `edges.<id>.colab-link.llm.<model>.{chat.completions,completions,models}`.
+  The payload is the OpenAI request body. Workers share a queue group, so
+  several VMs split the load.
+- **Replies.** A normal request gets one reply. With `"stream": true`, each
+  chunk is a separate message to the reply subject, and an empty message ends
+  the stream.
+- **Errors.** An error reply carries the header `Nats-Service-Error-Code` (the
+  HTTP status) and an OpenAI error body.
+- **No worker.** If no worker serves the model, NATS answers 503 (no
+  responders). The client then calls the service endpoint `llm_start
+  {model}` and retries.
+
+Chat is text only. Images go through batch jobs:
+`bin/colab-link ocr scans/ --out results/ocr` sends the images as one batch job
+and writes one `.txt` per image.
+
+The model server stops after the profile's `idle_minutes` without requests.
+
+## Idle VMs
+
+Colab bills a VM while it is assigned, so colab-link has three independent ways
+to stop VMs nobody is using:
+
+1. **The VM stops itself.** Supervisors ping each worker every 30 seconds. If a
+   worker hears nothing for 10 minutes, or its access token is about to expire,
+   it releases its own VM through the Colab API. This works even if the machine
+   running colab-link is gone.
+2. **The service stops VMs** whose worker is idle or whose heartbeat is
+   missing, and it stops all of its VMs when it shuts down.
+3. **The reaper** (`colab-link reap`, from cron, or the `reaper` service in
+   `compose.yaml`) checks every session on the account:
+   - it keeps sessions whose worker is supervised, and sessions with a lease;
+   - it stops any other session after 15 minutes;
+   - even a supervised session is stopped once it has been idle 10 minutes past
+     its idle limit, or has run 12 hours without a lease.
+
+   Before you use Colab by hand (for example in a browser), take a lease with
+   `colab-link lease --all --minutes 120`.
+
 ## Job contract
 
 ```

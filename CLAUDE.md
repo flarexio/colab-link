@@ -86,6 +86,7 @@ Phases: ① Colab feasibility (done) → ② Drive cache (done) → ③ CLI (don
 - `colab_link/worker.py` (on the VM, edge worker): see its docstring for the subject list. One job at a time; `.ctl` accepts `drive_token` (the token is refreshed every 40 min over NATS) and `shutdown`.
 - `colab_link/runner.py`: the old exec-polling transport (`run --transport exec`), kept as a fallback.
 - `colab_link/service.py`: **`colab-link serve`** (the server-side service; see the "Service mode" section). `colab_link/client.py`: submit/fetch/status for the CLI.
+- `colab_link/guard.py`: reaper + leases (see "Idle-VM guard"). `colab_link/colab_api.py` (stdlib, local and on the VM): list/unassign sessions through the Colab API. `colab_link/openai_gateway.py`: local OpenAI HTTP endpoint → NATS LLM workers.
 - `colab_link/jobhost.py` (on the VM): keeps a job module that defines `handle(in_dir, out_dir)` loaded, so a warm worker loads the model only once.
 - `Dockerfile` / `compose.yaml`: container for the service (image `flarexio/colab-link`).
 - `.github/workflows/`: **no QEMU**; each architecture builds on its own native runner (`ubuntu-24.04` / `ubuntu-24.04-arm`, free for public repos). `build.yml` (each push: compileall + image build + smoke test `profiles` and `colab --help`, per arch, not pushed); `release.yml` (pushing a `vX.Y.Z` tag: each arch pushes by digest, then a merge job runs `imagetools create` and pushes `flarexio/colab-link:{X.Y.Z,X.Y,X,latest}` to Docker Hub; secrets `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, same as claude-runner). `README.md` is the public-facing documentation.
@@ -160,6 +161,35 @@ bin/colab-link sessions | stop-all | usage                # sessions on the serv
   - **Adding the inductor cache cut model load from 304 s to 219 s**, about 85 s saved per cold start.
   - Total CU spent on these tests (including CPU tests): about 0.5 (195.48 → 194.98).
 - The JIT cache now also includes the torch inductor cache (`TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor`); the key gained `-v2`, so the first run rebuilds it.
+
+## Idle-VM guard (2026-10-17, the user's requirement: no Colab session may sit billing)
+Must hold even if the service crashes, this machine goes down, or **Claude hits its usage limit mid-test**. Three independent layers:
+1. **Worker self-stop** (`worker.py`): supervisors (`serve`, and the `run` client) send `.ctl {"op":"ping"}` every 30 s. No ctl for 10 min, or the access token within 5 min of expiry with no fresh one (expiry read from Google's tokeninfo) ⇒ the worker releases its own VM through the Colab API (`colab_api.py`, stdlib).
+   - Possible because the CLI's OAuth token (the one already sent to VMs for Drive) also carries the `colaboratory` scope. The VM learns its endpoint from env `COLAB_ENDPOINT` (from the CLI state file, `ColabSession.endpoint`).
+   - A warm worker that said `.bye` and was not stopped within 2 min also releases itself.
+2. **Supervisors**: idle `.bye` → `colab stop`; heartbeat lost 90 s → stop; SIGTERM → stop all (unchanged).
+3. **Reaper** (`guard.py`, `colab-link reap`), from **cron every 5 min on this machine** (installed 2026-10-17; log `~/.cache/colab-link/guard/reaper.log`; compose has a `reaper` service for the server; run it on one machine only, because leases are local).
+   - Looks at **every** session on the account (the user chose this, including browser notebooks).
+   - Keeps: a worker heartbeat with `supervised_s` < 180, unless idle more than its limit + 10 min or older than 12 h; or an unexpired lease.
+   - Everything else is stopped 15 min after it was last seen kept.
+   - **Before using Colab by hand (browser, bare `colab new`, probes): `colab-link lease ENDPOINT|--all --minutes N`**, or the reaper stops it.
+   - `run --transport exec` renews a 20-min lease on every poll.
+- Heartbeats now carry `endpoint`, `supervised_s`, `idle_s`, `idle_limit_s`.
+- `idle_minutes` is not part of the pool id: a job with a different `--idle-minutes` lands on an existing warm worker of the same pool.
+
+## LLM serving over NATS (2026-10-17)
+- `colab-link llm start|stop|ls MODEL`, `chat MODEL "prompt"`, `openai --port 8000` (local OpenAI-compatible HTTP endpoint).
+  - MODEL = a **servable profile** (vLLM venv + `MODEL` in env), e.g. `qwen35-9b-l4`.
+- Service endpoints `llm_start`/`llm_stop`/`llm_list`. An LLM pool (`llm-<profile>-<sha8>`, `mode: "llm"`) has no queue: while wanted, the service keeps one worker; that worker runs `vllm serve` on 127.0.0.1:8000 and leaves after `idle_minutes` without requests.
+  - LLM workers are never evicted for other pools.
+  - Their JIT cache key includes `_mode: llm` (different compiled graphs from the batch job).
+- **Wire protocol**: subject `edges.<edge>.colab-link.llm.<model>.{chat.completions,completions,models}`, queue group `llm-<model>`. The payload is the OpenAI request body.
+  - Without `stream`: one reply.
+  - With `stream: true`: one message per chunk to the reply inbox, then an empty message.
+  - Errors carry the header `Nats-Service-Error-Code` (HTTP status) and an OpenAI error body.
+  - No worker ⇒ NATS 503 no-responders; clients then call `llm_start` and wait.
+- **Text only** (user decision): `--language-model-only` skips the vision encoder. Images/OCR go through batch jobs (`colab-link ocr IMAGES...` builds `tasks.jsonl` for `jobs/vlm_batch.py` and writes one `.txt` per image). NATS max_payload is 1 MB.
+- Thinking is off by default (`--default-chat-template-kwargs '{"enable_thinking": false}'`; `ENABLE_THINKING=1` in the profile env turns it on).
 
 ## NATS (FlareX edge convention)
 - The user's server: `wss://nats.flarex.io` (JetStream + TLS, **decentralized JWT**).

@@ -20,6 +20,10 @@ from .nats_runner import FLAREX, NATS_URL, _drive, log
 TERMINAL = {"done", "failed", "cancelled"}
 
 
+class ServiceError(Exception):
+    """The colab-link service is not there or refused the request."""
+
+
 async def _connect():
     import nats
 
@@ -43,9 +47,9 @@ async def _request(nc, subject: str, body: dict, timeout: float = 30):
     try:
         msg = await nc.request(subject, json.dumps(body).encode(), timeout=timeout)
     except (NoRespondersError, TimeoutError):
-        sys.exit(f"no colab-link service answering on {subject}; is `colab-link serve` running?")
+        raise ServiceError(f"no colab-link service answering on {subject}; is `colab-link serve` running?")
     if msg.headers and msg.headers.get("Nats-Service-Error-Code"):
-        sys.exit(f"error {msg.headers['Nats-Service-Error-Code']}: {msg.headers.get('Nats-Service-Error')}")
+        raise ServiceError(f"error {msg.headers['Nats-Service-Error-Code']}: {msg.headers.get('Nats-Service-Error')}")
     return json.loads(msg.data)
 
 
@@ -130,3 +134,94 @@ async def collect(cfg: config.Config, rec: dict, out: Path | None) -> int:
     log(f"job {jid} {rec['status']} (exit {rec.get('exitcode')}); output in {out}")
     log(f"timings: {json.dumps(rec.get('timings'))}")
     return rec.get("exitcode") if rec.get("exitcode") is not None else 1
+
+
+# -- LLM (OpenAI bodies over NATS; see worker.py llm_loop) ---------------------------
+class NoWorker(Exception):
+    """Nobody serves this model right now (NATS: no responders)."""
+
+
+class LLMError(Exception):
+    def __init__(self, status: int, body: bytes):
+        self.status, self.body = status, body
+        super().__init__(f"{status}: {body[:300].decode(errors='replace')}")
+
+
+async def llm_request(nc, topic: str, model: str, route: str, body: dict, timeout: float = 600):
+    """Yield OpenAI objects: the response, or with body["stream"] each chunk."""
+    data = json.dumps(body).encode()
+    if len(data) > nc.max_payload - 4096:
+        raise LLMError(413, f"request is {len(data)} bytes; NATS allows {nc.max_payload}".encode())
+    inbox = nc.new_inbox()
+    sub = await nc.subscribe(inbox)
+    try:
+        await nc.publish(f"{topic}.llm.{model}.{route}", data, reply=inbox)
+        while True:
+            msg = await sub.next_msg(timeout=timeout)
+            hdr = msg.headers or {}
+            if hdr.get("Status") == "503":
+                raise NoWorker(model)
+            if hdr.get("Nats-Service-Error-Code"):
+                raise LLMError(int(hdr["Nats-Service-Error-Code"]), msg.data)
+            if not msg.data:
+                return  # end of stream
+            yield json.loads(msg.data)
+            if not body.get("stream"):
+                return
+    finally:
+        await sub.unsubscribe()
+
+
+async def ensure_llm(nc, topic: str, model: str, wait_s: float = 1200, idle_minutes: float | None = None,
+                     say=log) -> dict:
+    """Ask the service for a worker serving `model` and wait until it serves."""
+    view = await _request(nc, f"{topic}.llm_start", {"model": model, "idle_minutes": idle_minutes})
+    t0, last = time.time(), None
+    while True:
+        states = [w["state"] for w in view["workers"]]
+        if "serving" in states:
+            return view
+        if states != last:
+            say(f"{model}: {', '.join(states) or 'waiting for a VM'} ({time.time() - t0:.0f}s)")
+            last = states
+        if not view["wanted"] and not view["workers"]:
+            raise RuntimeError(f"{model} failed to start; see the colab-link serve log")
+        if time.time() - t0 > wait_s:
+            raise TimeoutError(f"{model} not serving after {wait_s:.0f}s")
+        await asyncio.sleep(5)
+        view = next(v for v in await _request(nc, f"{topic}.llm_list", {}) if v["model"] == model)
+
+
+async def chat(model: str, messages: list[dict], start: bool = True, **params) -> int:
+    """Stream one chat completion to stdout (colab-link chat)."""
+    nc, topic = await _connect()
+    body = {"messages": messages, "stream": True, "stream_options": {"include_usage": True}, **params}
+    try:
+        for attempt in range(2):
+            try:
+                usage, t0, first = None, time.time(), None
+                async for chunk in llm_request(nc, topic, model, "chat.completions", body):
+                    for c in chunk.get("choices", []):
+                        text = (c.get("delta") or {}).get("content")
+                        if text:
+                            first = first or time.time()
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
+                    usage = chunk.get("usage") or usage
+                print()
+                if usage:
+                    gen = time.time() - (first or t0)
+                    log(f"{usage.get('prompt_tokens')} prompt + {usage.get('completion_tokens')} output tokens; "
+                        f"first token {(first or t0) - t0:.1f}s, "
+                        f"{(usage.get('completion_tokens') or 0) / max(gen, 1e-3):.0f} tok/s")
+                return 0
+            except NoWorker:
+                if not start or attempt:
+                    sys.exit(f"no worker serves {model}; run `colab-link llm start {model}`")
+                log(f"{model} is not running; starting it on Colab (cold start takes several minutes)")
+                await ensure_llm(nc, topic, model)
+    except LLMError as e:
+        sys.exit(f"error {e}")
+    finally:
+        await nc.drain()
+    return 1
